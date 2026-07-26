@@ -16,7 +16,7 @@ dependencies = [
     "pytorch-kinematics",
     "grpcio>=1.62.3",
     "protobuf>=4.25.9,<5",
-    "orca_core @ git+https://github.com/orcahand/orca_core.git@main",
+    "orca_core @ file:///Users/fracapuano/Documents/orca_core",
 ]
 
 [project.optional-dependencies]
@@ -38,7 +38,7 @@ avp = [
     "avp-stream>=1.0,<2.0",
 ]
 metaquest = [
-    # Add metaquest-related dependencies here
+    "aiohttp>=3.10",
 ]
 manus = [
     "pyzmq>=25.0",
@@ -46,6 +46,11 @@ manus = [
 ]
 sim = [
     "orca_sim @ git+https://github.com/orcahand/orca_sim.git@main"
+]
+learning = [
+    # `uv sync --extra learning` is enough for dataset recording/training.
+    "orca_teleop[mediapipe,metaquest,adaptive]",
+    "lerobot>=0.4,<0.5",
 ]
 
 [build-system]
@@ -56,6 +61,7 @@ build-backend = "hatchling.build"
 packages = ["src/orca_teleop"]
 artifacts = [
     "src/orca_teleop/ingress/*.proto",
+    "src/orca_teleop/ingress/metaquest/web/*",
     "src/orca_teleop/retargeting/configs/*.yaml",
 ]
 
