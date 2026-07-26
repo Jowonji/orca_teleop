@@ -37,11 +37,14 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from orca_core import OrcaHand, OrcaJointPositions
 
+# ``OpenCVCameraConfig`` is also re-exported here for callers that historically
+# imported it from ``orca_teleop.pipeline``.
+from orca_teleop.cameras import CameraManager, OpenCVCameraConfig
 from orca_teleop.constants import (
     DEFAULT_CONFIDENCE,
     DEFAULT_HAND,
@@ -57,6 +60,7 @@ from orca_teleop.retargeting.retargeter import Retargeter, RetargeterBackend, Ta
 logger = logging.getLogger(__name__)
 
 _SHUTDOWN = object()
+LandmarkSource = Literal["mediapipe", "metaquest", "webxr"]
 
 
 def _shutdown_queue(q: "queue.Queue[Any]") -> None:
@@ -73,10 +77,16 @@ class TeleopQueues:
     actions_q: "queue.Queue[OrcaJointPositions | object]"
 
 
-@dataclass(frozen=True)
-class OpenCVCameraConfig:
-    name: str
-    index: int = 0
+@dataclass
+class SinkObservation:
+    """One synchronized observation produced by a sink.
+
+    ``joint_state`` is proprioception aligned with the sink's ``joint_ids``;
+    ``images`` maps each camera name to an RGB ``(H, W, 3)`` uint8 frame.
+    """
+
+    joint_state: np.ndarray
+    images: dict[str, np.ndarray]
 
 
 class RobotSink(ABC):
@@ -101,7 +111,22 @@ class RobotSink(ABC):
 
 
 class RecordableSink(RobotSink):
-    """Robot sink that can expose synchronized state/images for dataset recording."""
+    """A sink that owns and composes the full observation for recording.
+
+    Beyond driving the robot, a recordable sink is the single source of truth
+    for its observation — proprioception plus any cameras. Those cameras are the
+    sink's own concern: real cameras it opens from configs, and/or intrinsic
+    sources only it can produce (e.g. a sim's MuJoCo render). This keeps the
+    recorder a thin wrapper that merely packages ``get_observation()`` into the
+    target dataset format.
+
+    Contract:
+      - ``joint_ids``: names for the proprioception/action vectors.
+      - ``camera_shapes``: ``{name: (H, W, C)}`` for every image the observation
+        contains (known before recording so the dataset schema can be built).
+      - ``get_observation()``: one synchronized :class:`SinkObservation`.
+      - ``dispatch_action()``: send a commanded action to the robot.
+    """
 
     @property
     @abstractmethod
@@ -112,13 +137,18 @@ class RecordableSink(RobotSink):
     def camera_shapes(self) -> dict[str, tuple[int, int, int]]: ...
 
     @abstractmethod
-    def get_joint_state(self) -> np.ndarray: ...
-
-    @abstractmethod
-    def capture_frames(self) -> dict[str, np.ndarray]: ...
+    def get_observation(self) -> SinkObservation: ...
 
     @abstractmethod
     def dispatch_action(self, action: OrcaJointPositions) -> None: ...
+
+    @abstractmethod
+    def home_position(self) -> OrcaJointPositions:
+        """Target joint pose used as the idle reference between episodes."""
+
+    @abstractmethod
+    def go_home(self) -> None:
+        """Move the hand to the recording rest pose between episodes."""
 
 
 class OrcaHandSink(RecordableSink):
@@ -132,48 +162,68 @@ class OrcaHandSink(RecordableSink):
         self,
         model_path: str | None,
         camera_configs: list[OpenCVCameraConfig] | None = None,
+        connect_hardware: bool = True,
     ) -> None:
         self._model_path = model_path
         self._hand = OrcaHand(model_path)
-        self._camera_configs = [] if camera_configs is None else list(camera_configs)
-        self._captures: dict[str, Any] = {}
-        self._camera_shapes: dict[str, tuple[int, int, int]] = {}
+        self._connect_hardware = connect_hardware
+        self._cameras = CameraManager(camera_configs or [])
 
     def connect(self) -> None:
-        success, message = self._hand.connect()
-        if not success:
-            raise RuntimeError(f"Robot failed to connect: {message}")
-
-        self._hand.init_joints()
-        self._open_cameras()
+        if self._connect_hardware:
+            success, message = self._hand.connect()
+            if not success:
+                raise RuntimeError(f"Robot failed to connect: {message}")
+            self._hand.init_joints()
+        else:
+            logger.warning(
+                "OrcaHandSink: hardware connection skipped (connect_hardware=False) — "
+                "joint state is reported as zeros and actions are NOT dispatched. Useful "
+                "for validating the recording/vision pipeline without a physical hand."
+            )
+        self._cameras.open()
+        self._cameras.ensure_live()
 
     @property
     def joint_ids(self) -> list[str]:
         return list(self._hand.config.joint_ids)
 
     @property
-    def camera_shapes(self) -> dict[str, tuple[int, int, int]]:
-        return dict(self._camera_shapes)
+    def handedness(self) -> str:
+        """Physical hand side declared by the loaded OrcaHand config."""
+        return str(self._hand.config.type)
 
-    def get_joint_state(self) -> np.ndarray:
+    @property
+    def camera_shapes(self) -> dict[str, tuple[int, int, int]]:
+        return self._cameras.shapes
+
+    def get_observation(self) -> SinkObservation:
+        return SinkObservation(
+            joint_state=self._read_joint_state(),
+            images=self._cameras.capture(),
+        )
+
+    def _read_joint_state(self) -> np.ndarray:
+        if not self._connect_hardware:
+            return np.zeros(len(self.joint_ids), dtype=np.float32)
         return self._hand.get_joint_position().as_array(self.joint_ids).astype(np.float32)
 
-    def capture_frames(self) -> dict[str, np.ndarray]:
-        if not self._captures:
-            return {}
-
-        import cv2  # lazy
-
-        frames: dict[str, np.ndarray] = {}
-        for name, cap in self._captures.items():
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                raise RuntimeError(f"Camera {name!r} read failed mid-episode.")
-            frames[name] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return frames
-
     def dispatch_action(self, action: OrcaJointPositions) -> None:
+        if not self._connect_hardware:
+            return
         self._hand.set_joint_positions(action, num_steps=MOTION_NUM_STEPS)
+
+    def go_home(self) -> None:
+        if not self._connect_hardware:
+            return
+
+        # Homing to neutral position with 0 wrist
+        self._hand.set_joint_positions(self.home_position(), num_steps=5 * MOTION_NUM_STEPS)
+
+    def home_position(self) -> OrcaJointPositions:
+        positions = dict(self._hand.config.neutral_position)
+        positions["wrist"] = 0.0
+        return OrcaJointPositions(positions)
 
     def run_loop(
         self,
@@ -195,42 +245,15 @@ class OrcaHandSink(RecordableSink):
         if self._hand is None:
             return
         try:
-            self._release_cameras()
-            self._hand.set_zero_position()
-            self._hand.disable_torque()
-            self._hand.disconnect()
+            self._cameras.close()
+            if self._connect_hardware:
+                self._hand.set_zero_position()
+                self._hand.disable_torque()
+                self._hand.disconnect()
         except Exception:
             logger.exception("OrcaHandSink.close() encountered an error")
         finally:
             self._hand = None
-
-    def _open_cameras(self) -> None:
-        if not self._camera_configs:
-            return
-
-        import cv2  # lazy
-
-        for config in self._camera_configs:
-            cap = cv2.VideoCapture(config.index)
-            if not cap.isOpened():
-                raise RuntimeError(f"Failed to open camera {config.name!r} (index {config.index}).")
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                cap.release()
-                raise RuntimeError(f"Camera {config.name!r} returned no frame on probe read.")
-            self._captures[config.name] = cap
-            self._camera_shapes[config.name] = tuple(int(x) for x in frame.shape)
-
-        logger.info("Opened cameras: %s", self._camera_shapes)
-
-    def _release_cameras(self) -> None:
-        for cap in self._captures.values():
-            try:
-                cap.release()
-            except Exception:
-                pass
-        self._captures.clear()
-        self._camera_shapes.clear()
 
 
 def retargeter_worker(
@@ -241,6 +264,7 @@ def retargeter_worker(
     retargeter_backend: RetargeterBackend = "adaptive_analytical",
     retargeter_config_path: str | None = None,
     landmarks_viz: Any | None = None,
+    landmark_source: LandmarkSource = "mediapipe",
 ) -> None:
     """Consume ``HandLandmarks`` from the gRPC ingress, retarget, push to actions_q.
 
@@ -251,6 +275,12 @@ def retargeter_worker(
     calibration window it may return ``None``, in which case no robot command is
     enqueued yet.
     """
+    if landmark_source not in ("mediapipe", "metaquest", "webxr"):
+        raise ValueError(
+            f"Unsupported landmark source {landmark_source!r}; expected "
+            "'mediapipe', 'metaquest', or 'webxr'."
+        )
+
     _LOG_EVERY = 30
     _t_retarget_ms: list[float] = []
     _t_window_start: float = time.perf_counter()
@@ -278,12 +308,27 @@ def retargeter_worker(
             if not isinstance(item, HandLandmarks):
                 raise ValueError(f"Expected instance of HandLandmarks, got {type(item)}")
 
+            keypoints = item.keypoints
+            if landmark_source == "metaquest":
+                from orca_teleop.ingress.metaquest.landmarks import (
+                    retargeter_landmarks_from_quest,
+                )
+
+                keypoints = retargeter_landmarks_from_quest(keypoints, item.handedness)
+
             if landmarks_viz is not None:
-                landmarks_viz.put(item.keypoints, item.handedness)
+                landmarks_viz.put(keypoints, item.handedness)
 
             t_retarget_start = time.perf_counter()
             try:
-                target_pose = TargetPose(joint_positions=item.keypoints, source="mediapipe")
+                # After the Quest convention adapter, all ingress types are in
+                # the canonical MediaPipe-style frame consumed by both hand
+                # retargeter backends.
+                target_pose = TargetPose(
+                    joint_positions=keypoints,
+                    source="mediapipe",
+                    wrist_angle_degrees=item.wrist_angle_degrees,
+                )
                 action = retargeter.retarget(target_pose)
             except (AssertionError, ValueError):
                 logger.debug("Skipping degenerate landmark frame.")
@@ -361,6 +406,7 @@ def run(
     visualize_landmarks: bool = False,
     retargeter_backend: RetargeterBackend = "adaptive_analytical",
     retargeter_config_path: str | None = None,
+    landmark_source: LandmarkSource = "mediapipe",
 ) -> None:
     """Start the full teleop pipeline:
     - gRPC-ingress -> retargeter -> robot consumer
@@ -381,6 +427,9 @@ def run(
             is the default Wuji-style Orca-native backend; ``"rmsprop"`` keeps
             the historical fingertip key-vector backend available.
         retargeter_config_path: Optional YAML config for the adaptive backend.
+        landmark_source: Landmark convention received over gRPC. Live ``webxr``
+            frames are already in the canonical 21-point layout; legacy
+            ``metaquest`` HTS/Unity replays still need their historical mirror.
     """
     if sink is None:
         sink = OrcaHandSink(model_path)
@@ -418,6 +467,7 @@ def run(
             retargeter_backend,
             retargeter_config_path,
             landmarks_viz,
+            landmark_source,
         ),
         name="retargeter",
     )
@@ -465,6 +515,46 @@ def _mediapipe_publisher(
         handedness=handedness,
         confidence=confidence,
         show_video=show_video,
+    )
+    publisher.run()
+
+
+def _metaquest_publisher(
+    port: int,
+    handedness: str,
+    quest_host: str,
+    quest_port: int,
+    fps: int,
+    wrist_enabled: bool = True,
+    wrist_scale: float = 1.0,
+    reset_event: Any | None = None,
+) -> None:
+    """Entry point for the repository-owned Quest WebXR publisher subprocess."""
+    from orca_teleop.ingress.metaquest.publisher import MetaQuestPublisher
+
+    server_address = f"localhost:{port}"
+    deadline = time.monotonic() + 10.0
+
+    while True:
+        try:
+            with socket.create_connection(tuple(server_address.split(":")), timeout=0.5):
+                break
+        except OSError as err:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Ingress server on {server_address} did not become ready"
+                ) from err
+            time.sleep(0.1)
+
+    publisher = MetaQuestPublisher(
+        server_address=server_address,
+        handedness=handedness,
+        quest_host=quest_host,
+        quest_port=quest_port,
+        fps=fps,
+        wrist_enabled=wrist_enabled,
+        wrist_scale=wrist_scale,
+        reset_event=reset_event,
     )
     publisher.run()
 
@@ -587,6 +677,73 @@ def run_manus_local(
             port=port,
             sink=sink,
             visualize_landmarks=visualize_landmarks,
+        )
+    finally:
+        if publisher_process.is_alive():
+            publisher_process.terminate()
+        publisher_process.join(timeout=3.0)
+
+
+def run_metaquest_local(
+    model_path: str | None = None,
+    urdf_path: str | None = None,
+    port: int = DEFAULT_PORT,
+    handedness: str = DEFAULT_HAND,
+    quest_host: str = "0.0.0.0",
+    quest_port: int = 8765,
+    quest_fps: int = 30,
+    wrist_enabled: bool = True,
+    wrist_scale: float = 1.0,
+    sink: RobotSink | None = None,
+    visualize_landmarks: bool = False,
+    retargeter_backend: RetargeterBackend = "adaptive_analytical",
+    retargeter_config_path: str | None = None,
+) -> None:
+    """Run ``run()`` plus a local Quest WebXR publisher for one-command teleop."""
+    import multiprocessing
+
+    print(
+        "\033[93mOpen the printed Quest WebXR URL in Quest Browser, then enter VR and "
+        "enable hand tracking. Live WebXR frames use the canonical landmark layout "
+        "(retargeter landmark_source='webxr').\033[0m"
+    )
+
+    ctx = multiprocessing.get_context("spawn")
+    publisher_process = ctx.Process(
+        target=_metaquest_publisher,
+        args=(
+            port,
+            handedness,
+            quest_host,
+            quest_port,
+            quest_fps,
+            wrist_enabled,
+            wrist_scale,
+            None,
+        ),
+        name="metaquest-webxr-publisher",
+        daemon=True,
+    )
+
+    publisher_process.start()
+    logger.info(
+        "Local MetaQuest WebXR publisher started (pid=%d, hand=%s, http=%s:%d)",
+        publisher_process.pid,
+        handedness,
+        quest_host,
+        quest_port,
+    )
+
+    try:
+        run(
+            model_path=model_path,
+            urdf_path=urdf_path,
+            port=port,
+            sink=sink,
+            visualize_landmarks=visualize_landmarks,
+            retargeter_backend=retargeter_backend,
+            retargeter_config_path=retargeter_config_path,
+            landmark_source="webxr",
         )
     finally:
         if publisher_process.is_alive():

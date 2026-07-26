@@ -20,6 +20,9 @@ from dataclasses import dataclass
 import numpy as np
 
 from orca_teleop.constants import (
+    DEFAULT_CAMERA_FPS,
+    DEFAULT_CAMERA_HEIGHT,
+    DEFAULT_CAMERA_WIDTH,
     DEFAULT_MAX_PROBE_INDEX,
     MACOS_PLATFORM,
     STALE_FRAME_TIMEOUT_S,
@@ -83,6 +86,19 @@ def parse_camera_spec(spec: str) -> OpenCVCameraConfig:
         width, height = int(w_str), int(h_str)
 
     return OpenCVCameraConfig(name=name, index=index, width=width, height=height, fps=fps)
+
+
+def with_recording_defaults(config: OpenCVCameraConfig) -> OpenCVCameraConfig:
+    """Fill omitted resolution/fps with the standard recording defaults."""
+    return OpenCVCameraConfig(
+        name=config.name,
+        index=config.index,
+        width=config.width if config.width is not None else DEFAULT_CAMERA_WIDTH,
+        height=config.height if config.height is not None else DEFAULT_CAMERA_HEIGHT,
+        fps=config.fps if config.fps is not None else DEFAULT_CAMERA_FPS,
+        warmup_frames=config.warmup_frames,
+        rotate=config.rotate,
+    )
 
 
 def _rotate_code(rotate: int | None):
@@ -302,6 +318,22 @@ class CameraManager:
     def capture(self) -> dict[str, np.ndarray]:
         """Return the latest frame from each camera as ``{name: RGB array}``."""
         return {camera.name: camera.read() for camera in self._cameras}
+
+    def ensure_live(self, samples: int = 3, interval_s: float = 0.05) -> None:
+        """Verify every open camera keeps producing fresh frames.
+
+        Raises ``RuntimeError`` on the first stale/dead camera. A single successful
+        ``open()`` is not enough — Continuity Camera in particular can open, then
+        stop delivering frames — so recording callers should probe repeatedly.
+        """
+        if samples < 1:
+            raise ValueError(f"samples must be >= 1, got {samples}")
+        if not self._cameras:
+            return
+        for i in range(samples):
+            self.capture()
+            if i + 1 < samples:
+                time.sleep(interval_s)
 
     def close(self) -> None:
         for camera in self._cameras:
