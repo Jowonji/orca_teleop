@@ -2,13 +2,17 @@
 
 Record — per episode:
 
-  - main thread: pull each ``OrcaJointPositions`` from ``actions_q``, read
-    the sink joint state, capture one frame from each configured camera,
-    pack everything into a frame dict, push it onto ``rec_q``, then dispatch
-    the action to the sink.
+  - teleop consumer thread: owns ``actions_q``, mirrors the latest command, and
+    dispatches to the hand at teleop rate (independent of recording)
+  - main thread: sample the sink on a fixed ``--fps`` clock (default 30 Hz).
+    Each tick snapshots the mirrored teleop command and current observations
+    into one dataset row. Recording timing does not drive robot dispatch.
   - recorder thread: blocks on ``rec_q``, calls ``dataset.add_frame(...)`` for
     every dict, and ``dataset.save_episode()`` when it sees the SAVE sentinel
-  - between episodes: a small rest pause; at the end: optional push to Hub
+  - episodes after the first begin with ``go_home()`` (reset to the recording home
+    pose), rest (default 5 s) with no teleop dispatch, then sensor warmup and
+    recording; episode 1 starts without homing; SPACE saves and advances; at
+    the end: optional push to Hub
 
 Add cameras:
 
@@ -19,9 +23,10 @@ Add cameras:
 
       python scripts/record_dataset.py --list-cameras
 
-  then pass ``--camera NAME:INDEX[:WIDTHxHEIGHT][@FPS]`` (repeatable). To validate
-  the camera pipeline *without* the physical hand, add ``--stub`` (state/action
-  are dummy, but real video is recorded).
+  then pass ``--camera NAME:INDEX[:WIDTHxHEIGHT][@FPS]`` (repeatable). Omitted
+  resolution/fps default to 640x480@30. To validate the camera pipeline
+  *without* the physical hand, add ``--stub`` (state/action are dummy, but real
+  video is recorded).
 
 Example usage:
 
@@ -76,12 +81,12 @@ from orca_teleop.cameras import (
     OpenCVCameraConfig,
     parse_camera_spec,
     print_available_cameras,
+    with_recording_defaults,
 )
 from orca_teleop.constants import (
     DEFAULT_CONFIDENCE,
     DEFAULT_HAND,
     DEFAULT_PORT,
-    HEARTBEAT_INTERVAL,
     JOIN_TIMEOUT,
     QUEUES_MAXSIZE,
     SIM_RENDER_MODE,
@@ -97,6 +102,13 @@ from orca_teleop.pipeline import (
     _metaquest_publisher,
     retargeter_worker,
 )
+from orca_teleop.recording import (
+    TeleopActionMirror,
+    drain_actions_queue,
+    teleop_consumer_loop,
+    wait_for_teleop_mirror_ready,
+)
+from orca_teleop.utils import RateTicker
 
 logger = logging.getLogger(__name__)
 
@@ -107,11 +119,12 @@ MODEL_PATH = (
 _DEFAULT_FPS = 30
 _DEFAULT_NUM_EPISODES = 1
 _DEFAULT_EPISODE_SECONDS = 30.0
-_DEFAULT_REST_SECONDS = 3.0
+_DEFAULT_REST_SECONDS = 5.0
 
-# Sentinel pushed onto rec_q between episodes — the recorder calls
-# dataset.save_episode() in response, then keeps draining the next episode.
+# Sentinels pushed onto rec_q between episodes — the recorder either flushes
+# (save) or drops (discard) the in-progress episode buffer, then keeps draining.
 _SAVE_EPISODE = object()
+_DISCARD_EPISODE = object()
 
 
 class _KeyboardController:
@@ -120,7 +133,8 @@ class _KeyboardController:
     Puts the TTY in cbreak mode (so keys are delivered without waiting for Enter,
     while Ctrl+C still raises ``KeyboardInterrupt``) and maps:
 
-      - ``space`` -> ``advance_event`` (end + save the current episode, start next)
+      - ``space`` -> ``advance_event`` (stop recording, save episode, then start
+        the next episode with go_home + rest)
       - ``q`` / ``Q`` / ``Esc`` -> ``stop_event`` (end the whole recording session)
 
     The terminal state is always restored on ``stop()`` or thread exit.
@@ -193,7 +207,7 @@ def _default_lerobot_root(repo_id: str) -> Path:
 
 
 def _parse_camera_configs(specs: list[str]) -> list[OpenCVCameraConfig]:
-    return [parse_camera_spec(spec) for spec in specs]
+    return [with_recording_defaults(parse_camera_spec(spec)) for spec in specs]
 
 
 def _stub_action_publisher(
@@ -229,18 +243,37 @@ def _stub_action_publisher(
         time.sleep(period)
 
 
-def _recorder_loop(dataset, rec_q: "queue.Queue") -> None:
-    """Drain rec_q. Frames are dicts; ``_SAVE_EPISODE`` flushes; ``None`` exits."""
+def _recorder_loop(
+    dataset,
+    rec_q: "queue.Queue",
+    episode_finalized_q: "queue.Queue[bool]",
+) -> None:
+    """Drain rec_q. Frames are dicts; save/discard sentinels finalize; ``None`` exits."""
     while True:
         item = rec_q.get()
         if item is None:
             break
         if item is _SAVE_EPISODE:
+            succeeded = False
             try:
                 dataset.save_episode()
                 logger.info("Episode saved.")
+                succeeded = True
             except Exception:
                 logger.exception("Failed to save episode")
+            finally:
+                episode_finalized_q.put(succeeded)
+            continue
+        if item is _DISCARD_EPISODE:
+            succeeded = False
+            try:
+                dataset.clear_episode_buffer()
+                logger.warning("Episode discarded (incomplete / sensor failure).")
+                succeeded = True
+            except Exception:
+                logger.exception("Failed to discard episode buffer")
+            finally:
+                episode_finalized_q.put(succeeded)
             continue
         try:
             dataset.add_frame(item)
@@ -289,7 +322,8 @@ def _main_record(argv: list[str]) -> None:
         "--rest-seconds",
         type=float,
         default=_DEFAULT_REST_SECONDS,
-        help=f"Pause between episodes (default: {_DEFAULT_REST_SECONDS})",
+        help="Pause after go_home() at the start of each episode after the first "
+        "episode (default: {_DEFAULT_REST_SECONDS})",
     )
     parser.add_argument(
         "--camera",
@@ -297,9 +331,10 @@ def _main_record(argv: list[str]) -> None:
         default=[],
         help=(
             "Camera spec NAME[:INDEX][:WIDTHxHEIGHT][@FPS], repeatable "
-            "(e.g. front:0, iphone:1:1280x720@30). Cameras become part of the "
-            "sink's observation; with --backend sim they're recorded alongside "
-            "the sim's MuJoCo render. Use --list-cameras to discover indices."
+            "(e.g. front:0, iphone:1 — defaults to 640x480@30 when omitted). "
+            "Cameras become part of the sink's observation; with --backend sim "
+            "they're recorded alongside the sim's MuJoCo render. "
+            "Use --list-cameras to discover indices."
         ),
     )
     parser.add_argument(
@@ -327,7 +362,7 @@ def _main_record(argv: list[str]) -> None:
         "--fps",
         type=int,
         default=_DEFAULT_FPS,
-        help=f"Dataset fps metadata (default: {_DEFAULT_FPS})",
+        help=f"Fixed dataset sampling rate in Hz (default: {_DEFAULT_FPS})",
     )
     parser.add_argument("--model-path", default=MODEL_PATH, help="OrcaHand model directory")
     parser.add_argument("--urdf-path", default=None, help="Hand URDF file")
@@ -491,6 +526,7 @@ def _main_record(argv: list[str]) -> None:
     logger.info("Dataset root: %s", dataset.root)
 
     rec_q: queue.Queue = queue.Queue(maxsize=64)
+    episode_finalized_q: queue.Queue[bool] = queue.Queue(maxsize=1)
 
     ingress_server: IngressServer | None = None
     retargeter_thread: threading.Thread | None = None
@@ -563,9 +599,28 @@ def _main_record(argv: list[str]) -> None:
         retargeter_thread.start()
 
     recorder_thread = threading.Thread(
-        target=_recorder_loop, args=(dataset, rec_q), name="dataset-recorder"
+        target=_recorder_loop,
+        args=(dataset, rec_q, episode_finalized_q),
+        name="dataset-recorder",
     )
     recorder_thread.start()
+
+    action_mirror = TeleopActionMirror()
+    dispatch_enabled = threading.Event()
+    teleop_thread = threading.Thread(
+        target=teleop_consumer_loop,
+        args=(queues.actions_q,),
+        kwargs={
+            "mirror": action_mirror,
+            "stop_event": stop_event,
+            "shutdown_sentinel": _SHUTDOWN,
+            "dispatch_action": None if args.stub else sink.dispatch_action,
+            "dispatch_enabled": dispatch_enabled,
+        },
+        name="teleop-consumer",
+        daemon=True,
+    )
+    teleop_thread.start()
 
     use_keyboard = args.episode_end in ("space", "both")
     use_timer = args.episode_end in ("timer", "both")
@@ -577,13 +632,15 @@ def _main_record(argv: list[str]) -> None:
 
     if use_keyboard:
         logger.info(
-            "Recording up to %d episode(s) — press SPACE to save the current episode "
-            "and start the next, 'q'/Esc to finish the session.",
+            "Recording up to %d episode(s). From episode 2 onward: go_home()"
+            "%s before recording. Press SPACE to save and advance, 'q'/Esc to finish.",
             args.num_episodes,
+            f", then rest {args.rest_seconds:.1f}s" if args.rest_seconds > 0 else "",
         )
     else:
         logger.info(
-            "Recording %d episode(s) of ~%.1fs each — Ctrl+C to abort.",
+            "Recording %d episode(s) of ~%.1fs each — each episode waits until teleop + "
+            "cameras are healthy before capturing. Ctrl+C to abort.",
             args.num_episodes,
             args.episode_seconds,
         )
@@ -596,29 +653,73 @@ def _main_record(argv: list[str]) -> None:
             advance_event.clear()
             if quest_reset_event is not None:
                 quest_reset_event.set()
+
+            if ep_idx > 0 and not args.stub:
+                logger.info("Resetting hand to home position...")
+                try:
+                    sink.go_home()
+                except Exception:
+                    logger.exception("Failed to move hand to home position; continuing anyway.")
+
+            if ep_idx > 0 and args.rest_seconds > 0 and not stop_event.is_set():
+                logger.info("Resting %.1fs before recording...", args.rest_seconds)
+                stop_event.wait(args.rest_seconds)
+
+            dispatch_enabled.clear()
+            action_mirror.reset()
+            drained = drain_actions_queue(
+                queues.actions_q,
+                stop_event=stop_event,
+                shutdown_sentinel=_SHUTDOWN,
+            )
+            if drained:
+                logger.debug(
+                    "Discarded %d stale teleop command(s) before episode %d.",
+                    drained,
+                    ep_idx + 1,
+                )
+            if stop_event.is_set():
+                break
+
+            ready = wait_for_teleop_mirror_ready(
+                get_observation=sink.get_observation,
+                mirror=action_mirror,
+                stop_event=stop_event,
+            )
+            if not ready:
+                logger.info(
+                    "Stopped before episode %d — waiting for sensors ended without readiness.",
+                    ep_idx + 1,
+                )
+                break
+
+            logger.info("Sensors ready — recording episode %d at %d Hz.", ep_idx + 1, args.fps)
+            dispatch_enabled.set()
             ep_end = time.perf_counter() + args.episode_seconds
             n_frames = 0
+            episode_ok = True
+            ticker = RateTicker(dt=1.0 / float(args.fps))
 
             while not stop_event.is_set():
                 if use_keyboard and advance_event.is_set():
                     break
                 if use_timer and time.perf_counter() >= ep_end:
                     break
-                try:
-                    action = queues.actions_q.get(timeout=HEARTBEAT_INTERVAL)
-                except queue.Empty:
+
+                action = action_mirror.snapshot()
+                if action is None:
+                    ticker.tick()
                     continue
-                if action is _SHUTDOWN:
-                    stop_event.set()
-                    break
-                assert isinstance(action, OrcaJointPositions)
 
                 action_arr = action.as_array(joint_ids).astype(np.float32)
 
                 try:
                     observation = sink.get_observation()
                 except Exception:
-                    logger.exception("Observation capture failed; aborting episode.")
+                    logger.exception(
+                        "Observation capture failed; discarding episode and aborting session."
+                    )
+                    episode_ok = False
                     stop_event.set()
                     break
 
@@ -636,15 +737,24 @@ def _main_record(argv: list[str]) -> None:
                 except queue.Full:
                     logger.debug("rec_q full; dropping frame")
 
-                if not args.stub:
-                    sink.dispatch_action(action)
+                ticker.tick()
 
+            dispatch_enabled.clear()
             logger.info("Episode %d captured %d frames.", ep_idx + 1, n_frames)
-            rec_q.put(_SAVE_EPISODE)
-
-            if ep_idx + 1 < args.num_episodes and not stop_event.is_set() and args.rest_seconds > 0:
-                logger.info("Resting %.1fs before next episode...", args.rest_seconds)
-                stop_event.wait(args.rest_seconds)
+            if episode_ok and n_frames > 0:
+                logger.info("Finalizing episode %d before continuing...", ep_idx + 1)
+                rec_q.put(_SAVE_EPISODE)
+                if not episode_finalized_q.get():
+                    logger.error("Stopping because episode %d could not be saved.", ep_idx + 1)
+                    break
+            elif n_frames > 0:
+                logger.info("Discarding episode %d before continuing...", ep_idx + 1)
+                rec_q.put(_DISCARD_EPISODE)
+                if not episode_finalized_q.get():
+                    logger.error("Stopping because episode %d could not be discarded.", ep_idx + 1)
+                    break
+            elif not episode_ok:
+                logger.error("Episode %d produced no usable frames; not saving.", ep_idx + 1)
 
     except KeyboardInterrupt:
         logger.info("Interrupted — finalizing dataset.")
@@ -665,6 +775,7 @@ def _main_record(argv: list[str]) -> None:
             retargeter_thread.join(timeout=JOIN_TIMEOUT)
         if stub_thread is not None:
             stub_thread.join(timeout=JOIN_TIMEOUT)
+        teleop_thread.join(timeout=JOIN_TIMEOUT)
 
         recorder_thread.join()
 
