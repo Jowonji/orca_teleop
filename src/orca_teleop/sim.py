@@ -17,7 +17,8 @@ import orca_core
 from orca_core import OrcaHand, OrcaJointPositions
 from orca_sim.envs import BaseOrcaHandEnv
 
-from orca_teleop.pipeline import _SHUTDOWN, RecordableSink
+from orca_teleop.cameras import CameraManager, OpenCVCameraConfig
+from orca_teleop.pipeline import _SHUTDOWN, RecordableSink, SinkObservation
 from orca_teleop.utils import RateTicker
 
 logger = logging.getLogger(__name__)
@@ -77,11 +78,14 @@ class OrcaHandSimSink(RecordableSink):
         version: str | None = "v2",
         render_mode: str = "human",
         camera_config: SimCameraConfig | None = None,
+        camera_configs: list[OpenCVCameraConfig] | None = None,
     ) -> None:
         self._env_name = env_name
         self._version = version
         self._render_mode = render_mode
         self._camera_config = SimCameraConfig() if camera_config is None else camera_config
+        # OpenCV cameras composed into the observation alongside MuJoCo env renders.
+        self._cameras = CameraManager(camera_configs or [])
         self._env: BaseOrcaHandEnv = None
         self._actuator_joint_names: list[str] = []
         self._joint_qpos_adr: np.ndarray = np.empty(0, dtype=np.int64)
@@ -90,6 +94,7 @@ class OrcaHandSimSink(RecordableSink):
         self._renderer: Any | None = None
         self._record_camera: Any | None = None
         self._retarget_model_path: str | None = None
+        self._hand_config: Any | None = None
 
     def connect(self) -> None:
         import mujoco
@@ -114,6 +119,7 @@ class OrcaHandSimSink(RecordableSink):
         # joint ids and neutral pose from the matching orca_core config and map
         # the MuJoCo actuators onto those ids (the keys the retargeter emits).
         hand_config = self._load_hand_config()
+        self._hand_config = hand_config
         self._actuator_joint_names, self._joint_qpos_adr = self._map_actuators(
             mujoco, env.model, hand_config
         )
@@ -121,9 +127,7 @@ class OrcaHandSimSink(RecordableSink):
         # Hold neutral pose until the first retargeted command arrives.
         self._last_action = OrcaJointPositions(hand_config.neutral_position)
 
-        self._dt = 1.0 / float(
-            getattr(env, "metadata", {}).get("render_fps", DEFAULT_RENDER_FPS)
-        )
+        self._dt = 1.0 / float(getattr(env, "metadata", {}).get("render_fps", DEFAULT_RENDER_FPS))
 
         self._renderer = mujoco.Renderer(
             env.model,
@@ -133,8 +137,17 @@ class OrcaHandSimSink(RecordableSink):
         self._record_camera = mujoco.MjvCamera()
         mujoco.mjv_defaultFreeCamera(env.model, self._record_camera)
 
+        if self._camera_config.name in self._cameras.names:
+            raise ValueError(
+                f"Real camera name {self._camera_config.name!r} collides with the sim "
+                "render camera name; rename it (e.g. --camera side:1) so both "
+                "observations get distinct keys."
+            )
+        self._cameras.open()
+        self._cameras.ensure_live()
+
         logger.info(
-            "SimSink connected: env=%s version=%s actuators=%d dt=%.3fs camera=%s",
+            "SimSink connected: env=%s version=%s actuators=%d dt=%.3fs cameras=%s",
             self._env_name,
             getattr(env, "version", "?"),
             len(self._actuator_joint_names),
@@ -152,37 +165,50 @@ class OrcaHandSimSink(RecordableSink):
 
     @property
     def camera_shapes(self) -> dict[str, tuple[int, int, int]]:
+        # The intrinsic MuJoCo render plus any real cameras this sink owns.
         return {
             self._camera_config.name: (
                 self._camera_config.height,
                 self._camera_config.width,
                 3,
-            )
+            ),
+            **self._cameras.shapes,
         }
 
-    def get_joint_state(self) -> np.ndarray:
-        assert self._env is not None, "connect() must be called before get_joint_state()"
+    def get_observation(self) -> SinkObservation:
+        return SinkObservation(
+            joint_state=self._read_joint_state(),
+            images={self._camera_config.name: self._render(), **self._cameras.capture()},
+        )
+
+    def _read_joint_state(self) -> np.ndarray:
+        assert self._env is not None, "connect() must be called before get_observation()"
         # qpos addresses are stored in actuator order, so the returned array
         # lines up with ``self._actuator_joint_names`` (i.e. ``joint_ids``).
         state_rad = self._env.data.qpos[self._joint_qpos_adr]
         return np.rad2deg(state_rad).astype(np.float32)
 
-    def capture_frames(self) -> dict[str, np.ndarray]:
-        assert self._env is not None, "connect() must be called before capture_frames()"
+    def _render(self) -> np.ndarray:
+        assert self._env is not None, "connect() must be called before get_observation()"
         assert self._renderer is not None
         assert self._record_camera is not None
-
         self._renderer.update_scene(self._env.data, camera=self._record_camera)
-        return {
-            self._camera_config.name: np.asarray(
-                self._renderer.render(),
-                dtype=np.uint8,
-            )
-        }
+        return np.asarray(self._renderer.render(), dtype=np.uint8)
 
     def dispatch_action(self, action: OrcaJointPositions) -> None:
         assert self._env is not None, "connect() must be called before dispatch_action()"
         self._env.step(self._to_action_array(action))
+
+    def go_home(self) -> None:
+        assert self._env is not None, "connect() must be called before go_home()"
+        self._last_action = self.home_position()
+        self.dispatch_action(self._last_action)
+
+    def home_position(self) -> OrcaJointPositions:
+        assert self._hand_config is not None, "connect() must be called before home_position()"
+        positions = dict(self._hand_config.neutral_position)
+        positions["wrist"] = 0.0
+        return OrcaJointPositions(positions)
 
     def run_loop(
         self,
@@ -226,6 +252,7 @@ class OrcaHandSimSink(RecordableSink):
         if self._env is None:
             return
         try:
+            self._cameras.close()
             if self._renderer is not None:
                 self._renderer.close()
             self._env.close()
@@ -259,7 +286,7 @@ class OrcaHandSimSink(RecordableSink):
 
         Returns the per-actuator config joint id and the qpos address of each
         actuator's transmission joint, both in MuJoCo actuator order so the
-        ctrl vector and ``get_joint_state`` stay aligned with the action keys.
+        ctrl vector and the observed joint state stay aligned with the action keys.
         """
         valid_ids = set(hand_config.joint_ids)
         prefix = f"{self._env_name}_"
