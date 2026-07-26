@@ -3,16 +3,26 @@
 Live-plots, side by side, the hand pose extracted from the ingress and the
 per-finger key vectors fed into the IK against those reconstructed from the
 URDF after the optimizer step. Useful for iterating on the retargeter without
-running the robot.
+running the robot — and for deciding whether teleop mismatch is a retargeting
+problem or a landmark/sensor problem.
+
+How to read the plot
+--------------------
+  - Left panel looks like your hand? → source landmarks are usable?
+  - Right panel:
+    - dashed == solid → retargeting is healthy
+    - dashed != solid → retargeter / config / kinematics problem
 
 Two ways to run:
 
-    # 1) Spin everything up in one process (ingress + retargeter + local
-    #    MediaPipe publisher in a child process):
-    python scripts/retargeter_diagnostics.py --with-mediapipe
+    # Default adaptive_analytical backend with ready-to-use mediapipe publisher:
+    python scripts/retargeter_diagnostics.py --with-mediapipe --show-video \\
+        --model-path /path/to/orcahand_touch_right
 
-    # 2) Just start the diagnostic and bring your own publisher in another
-    #    terminal:
+    # Legacy key-vector backend (has live hyperparam sliders):
+    python scripts/retargeter_diagnostics.py --retargeter rmsprop --with-mediapipe
+
+    # Bring your own publisher:
     python scripts/retargeter_diagnostics.py
     python -m orca_teleop.ingress.mediapipe.publisher --server localhost:50051
 
@@ -25,12 +35,15 @@ Layout: a single matplotlib window with two panels.
            reconstruction, color-coded to match the left panel.
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
 import multiprocessing
 import queue
 import threading
 from dataclasses import dataclass
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -43,7 +56,7 @@ from orca_teleop.constants import HEARTBEAT_INTERVAL, QUEUES_MAXSIZE
 from orca_teleop.ingress import DEFAULT_PORT, HandLandmarks, IngressServer
 from orca_teleop.retargeting import utils as retargeter_utils
 from orca_teleop.retargeting.constants import MANO_TO_URDF_TRANSLATION
-from orca_teleop.retargeting.retargeter import FINGERS, Retargeter, TargetPose
+from orca_teleop.retargeting.retargeter import FINGERS, Retargeter, RetargeterBackend, TargetPose
 
 logger = logging.getLogger(__name__)
 
@@ -133,11 +146,17 @@ def _make_dynamic_loss(hp_holder: _HyperParamHolder):
 @dataclass
 class _Snapshot:
     landmarks: np.ndarray  # (21, 3) normalized MANO joints
-    target_kvs: np.ndarray  # (5, 3) palm-to-tip vectors from the ingress
-    robot_kvs: np.ndarray  # (5, 3) palm-to-tip vectors from URDF FK
+    target_kvs: np.ndarray  # (5, 3) palm-to-tip vectors from the ingress (m)
+    robot_kvs: np.ndarray  # (5, 3) palm-to-tip vectors from URDF FK (m)
+    tip_error_cm: np.ndarray  # (5,) per-finger ||robot - target|| in cm
+    backend: str
 
 
-def _compute_diagnostic_snapshot(
+def _tip_errors_cm(target_kvs_m: np.ndarray, robot_kvs_m: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(robot_kvs_m - target_kvs_m, axis=1) * 100.0
+
+
+def _compute_rmsprop_diagnostic_snapshot(
     retargeter: Retargeter, target_pose: TargetPose
 ) -> _Snapshot | None:
     """After ``retarget()``, recompute the values needed by the diagnostic.
@@ -183,10 +202,57 @@ def _compute_diagnostic_snapshot(
             [kv.squeeze(0) for kv in retargeter_utils.get_keyvectors(fingertips, palm)]
         )
 
+    target_np = target_kvs.detach().cpu().numpy()
+    robot_np = robot_kvs.detach().cpu().numpy()
     return _Snapshot(
         landmarks=np.asarray(normalized, dtype=float),
-        target_kvs=target_kvs.detach().cpu().numpy(),
-        robot_kvs=robot_kvs.detach().cpu().numpy(),
+        target_kvs=target_np,
+        robot_kvs=robot_np,
+        tip_error_cm=_tip_errors_cm(target_np, robot_np),
+        backend="rmsprop",
+    )
+
+
+def _compute_adaptive_diagnostic_snapshot(
+    retargeter: Any, target_pose: TargetPose
+) -> _Snapshot | None:
+    """Compare adaptive tip-vector targets against FK of the commanded qpos."""
+    from orca_teleop.retargeting.adaptive_analytical import M_TO_CM
+
+    if not retargeter._calibration_done:
+        return None
+
+    qpos_phys = retargeter._filter._state
+    if qpos_phys is None:
+        qpos_phys = retargeter._last_qpos_phys
+    if qpos_phys is None:
+        return None
+
+    normalized = retargeter_utils.get_normalized_local_manohand_joint_pos(
+        target_pose.joint_positions,
+        target_pose.source,
+    )
+    if retargeter._rotation_matrix is not None:
+        normalized = normalized @ retargeter._rotation_matrix.T
+
+    keypoints = retargeter._target_keypoints_in_urdf_frame(normalized)
+    # Same tip-vector objective the adaptive solver minimizes (cm → m for the plot).
+    target_kvs = retargeter._compute_tip_vectors(keypoints) / M_TO_CM
+
+    positions, _ = retargeter._robot.compute_positions_and_jacobians(
+        retargeter._full_model_qpos(np.asarray(qpos_phys, dtype=np.float64)),
+        retargeter._computed_frame_indices,
+        retargeter._frame_offsets,
+    )
+    palm = retargeter._robot_palm_from_positions(positions)
+    robot_kvs = positions[retargeter._tip_indices] - palm
+
+    return _Snapshot(
+        landmarks=np.asarray(normalized, dtype=float),
+        target_kvs=np.asarray(target_kvs, dtype=float),
+        robot_kvs=np.asarray(robot_kvs, dtype=float),
+        tip_error_cm=_tip_errors_cm(target_kvs, robot_kvs),
+        backend="adaptive_analytical",
     )
 
 
@@ -207,44 +273,62 @@ class _LatestSnapshot:
 
 
 def _retargeter_loop(
-    landmarks_q: "queue.Queue[HandLandmarks]",
+    landmarks_q: queue.Queue[HandLandmarks],
     stop_event: threading.Event,
     snapshot_holder: _LatestSnapshot,
     hp_holder: _HyperParamHolder,
     model_path: str | None,
     urdf_path: str | None,
+    backend: RetargeterBackend = "adaptive_analytical",
+    retargeter_config_path: str | None = None,
 ) -> None:
     try:
-        retargeter = Retargeter.from_paths(
-            model_path, urdf_path, ik_loss=_make_dynamic_loss(hp_holder)
-        )
+        if backend == "rmsprop":
+            retargeter = Retargeter.from_paths(
+                model_path,
+                urdf_path,
+                backend="rmsprop",
+                ik_loss=_make_dynamic_loss(hp_holder),
+            )
+        else:
+            retargeter = Retargeter.from_paths(
+                model_path,
+                urdf_path,
+                backend="adaptive_analytical",
+                config_path=retargeter_config_path,
+            )
     except Exception:
         logger.exception("Retargeter init failed; diagnostic loop exiting.")
         stop_event.set()
         return
 
-    # Patch _optimize so the number of IK steps per frame is read live from
-    # the hyperparam holder. The Retargeter calls ``self._optimize(target_kvs)``
-    # internally; assigning a plain function as an instance attribute shadows
-    # the bound method without re-binding ``self``.
-    _orig_optimize = retargeter._optimize
+    logger.info("Diagnostic retargeter ready (backend=%s)", backend)
 
-    def _patched_optimize(target_kvs: torch.Tensor) -> np.ndarray:
-        return _orig_optimize(target_kvs, n_steps=int(hp_holder.get().n_steps))
+    abd_indices: list[int] = []
+    if backend == "rmsprop":
+        # Patch _optimize so the number of IK steps per frame is read live from
+        # the hyperparam holder. The Retargeter calls ``self._optimize(target_kvs)``
+        # internally; assigning a plain function as an instance attribute shadows
+        # the bound method without re-binding ``self``.
+        _orig_optimize = retargeter._optimize
 
-    retargeter._optimize = _patched_optimize  # type: ignore[method-assign]
+        def _patched_optimize(target_kvs: torch.Tensor) -> np.ndarray:
+            return _orig_optimize(target_kvs, n_steps=int(hp_holder.get().n_steps))
 
-    abd_indices = [
-        retargeter.config.finger_joint_ids.index(jid)
-        for jid in _ABD_JOINT_NAMES
-        if jid in retargeter.config.finger_joint_ids
-    ]
-    if not abd_indices:
-        logger.warning(
-            "No abductor joints found in finger_joint_ids; the abd-reg slider "
-            "will have no effect on this hand model."
-        )
+        retargeter._optimize = _patched_optimize  # type: ignore[method-assign]
 
+        abd_indices = [
+            retargeter.config.finger_joint_ids.index(jid)
+            for jid in _ABD_JOINT_NAMES
+            if jid in retargeter.config.finger_joint_ids
+        ]
+        if not abd_indices:
+            logger.warning(
+                "No abductor joints found in finger_joint_ids; the abd-reg slider "
+                "will have no effect on this hand model."
+            )
+
+    frames = 0
     while not stop_event.is_set():
         try:
             item = landmarks_q.get(timeout=HEARTBEAT_INTERVAL)
@@ -253,16 +337,17 @@ def _retargeter_loop(
         if not isinstance(item, HandLandmarks):
             continue
 
-        # Sync live-tunable hyperparameters into the retargeter before each
-        # optimizer pass. lr/regularizer-weight live on mutable state we can
-        # poke directly; the loss coefficients are read from the holder inside
-        # the dynamic IK loss closure, so they need no per-frame sync here.
-        hp = hp_holder.get()
-        for pg in retargeter._optimizer.param_groups:
-            pg["lr"] = float(hp.lr)
-        if abd_indices:
-            with torch.no_grad():
-                retargeter._regularizer_weights[abd_indices] = float(hp.abd_reg_weight)
+        if backend == "rmsprop":
+            # Sync live-tunable hyperparameters into the retargeter before each
+            # optimizer pass. lr/regularizer-weight live on mutable state we can
+            # poke directly; the loss coefficients are read from the holder inside
+            # the dynamic IK loss closure, so they need no per-frame sync here.
+            hp = hp_holder.get()
+            for pg in retargeter._optimizer.param_groups:
+                pg["lr"] = float(hp.lr)
+            if abd_indices:
+                with torch.no_grad():
+                    retargeter._regularizer_weights[abd_indices] = float(hp.abd_reg_weight)
 
         try:
             target_pose = TargetPose(joint_positions=item.keypoints, source="mediapipe")
@@ -271,9 +356,24 @@ def _retargeter_loop(
             logger.debug("Skipping degenerate landmark frame.")
             continue
 
-        snap = _compute_diagnostic_snapshot(retargeter, target_pose)
+        if backend == "rmsprop":
+            snap = _compute_rmsprop_diagnostic_snapshot(retargeter, target_pose)
+        else:
+            snap = _compute_adaptive_diagnostic_snapshot(retargeter, target_pose)
         if snap is not None:
             snapshot_holder.set(snap)
+            frames += 1
+            if frames == 1 or frames % 60 == 0:
+                mean_err = float(np.mean(snap.tip_error_cm))
+                per_finger = ", ".join(
+                    f"{f}={e:.1f}" for f, e in zip(FINGERS, snap.tip_error_cm, strict=True)
+                )
+                logger.info(
+                    "Tip fit residual mean=%.1f cm [%s] (frame %d)",
+                    mean_err,
+                    per_finger,
+                    frames,
+                )
 
 
 @dataclass
@@ -286,8 +386,9 @@ class _PlotArtists:
 def _make_figure() -> tuple[plt.Figure, _PlotArtists]:
     fig = plt.figure(figsize=(11, 5))
     fig.suptitle(
-        "Retargeter diagnostics  —  left: extracted hand pose  |  "
-        "right: key vectors (dashed = target, solid = URDF prediction)"
+        "Retargeter diagnostics  —  left: landmarks  |  "
+        "right: tip vectors (dashed = target, solid = URDF)  |  "
+        "calibrating…"
     )
 
     ax_landmarks = fig.add_subplot(1, 2, 1, projection="3d")
@@ -358,6 +459,7 @@ def _animate(
     _frame: int,
     holder: _LatestSnapshot,
     artists: _PlotArtists,
+    fig: plt.Figure,
 ) -> list[Line3D]:
     flat: list[Line3D] = (
         list(artists.bone_lines.values())
@@ -383,6 +485,18 @@ def _animate(
         artists.robot_kv_lines[finger].set_data_3d(
             [origin[0], rob[0]], [origin[1], rob[1]], [origin[2], rob[2]]
         )
+
+    mean_err = float(np.mean(snap.tip_error_cm))
+    per_finger = "  ".join(
+        f"{f[0].upper()}={e:.1f}" for f, e in zip(FINGERS, snap.tip_error_cm, strict=True)
+    )
+    # Rough guide: <1.5 cm mean tip residual ⇒ IK is fitting; larger means
+    # retargeter can't realize the landmark tip targets on this URDF.
+    health = "IK healthy" if mean_err < 1.5 else "IK struggling"
+    fig.suptitle(
+        f"{snap.backend}  —  tip residual mean {mean_err:.1f} cm ({health})  |  "
+        f"{per_finger}  |  dashed=target  solid=URDF"
+    )
     return flat
 
 
@@ -481,6 +595,17 @@ def main() -> None:
         "--port", type=int, default=DEFAULT_PORT, help=f"gRPC port (default: {DEFAULT_PORT})"
     )
     parser.add_argument(
+        "--retargeter",
+        default="adaptive_analytical",
+        choices=["rmsprop", "adaptive_analytical"],
+        help="Retargeter backend (default: adaptive_analytical, same as teleop)",
+    )
+    parser.add_argument(
+        "--retarget-config",
+        default=None,
+        help="YAML config for --retargeter adaptive_analytical",
+    )
+    parser.add_argument(
         "--with-mediapipe",
         action="store_true",
         help="Spawn a local MediaPipe publisher in a child process.",
@@ -530,6 +655,8 @@ def main() -> None:
             hp_holder,
             args.model_path,
             args.urdf_path,
+            args.retargeter,
+            args.retarget_config,
         ),
         name="retargeter-diagnostic",
         daemon=True,
@@ -545,11 +672,12 @@ def main() -> None:
         logger.warning("--show-video has no effect without --with-mediapipe; ignoring.")
 
     fig, artists = _make_figure()
-    _slider_fig = _make_slider_figure(hp_holder)
+    # Live hyperparam sliders only apply to the RMSprop optimizer.
+    _slider_fig = _make_slider_figure(hp_holder) if args.retargeter == "rmsprop" else None
     _anim = FuncAnimation(
         fig,
         _animate,
-        fargs=(snapshot_holder, artists),
+        fargs=(snapshot_holder, artists, fig),
         interval=50,
         blit=False,
         cache_frame_data=False,
@@ -564,6 +692,7 @@ def main() -> None:
         if publisher_proc is not None and publisher_proc.is_alive():
             publisher_proc.terminate()
             publisher_proc.join(timeout=3.0)
+        del _slider_fig, _anim
 
 
 if __name__ == "__main__":
