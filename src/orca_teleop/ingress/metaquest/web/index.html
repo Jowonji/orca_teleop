@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OrcaHand WebXR Teleop</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <p class="eyebrow">Meta Quest → OrcaHand</p>
+        <h1>WebXR hand tracking</h1>
+        <p class="lede">
+          This page is served by your teleoperation process. It streams WebXR
+          hand joints directly to the host; no headset app is required.
+        </p>
+        <button id="start-button" class="primary">Start hand tracking</button>
+        <p id="status" class="status">Idle</p>
+      </section>
+    </main>
+    <canvas id="xr-canvas"></canvas>
+    <script src="/app.js"></script>
+  </body>
+</html>
