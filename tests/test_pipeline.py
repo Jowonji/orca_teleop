@@ -111,6 +111,7 @@ def test_ingress_server_receives_frames():
                 keypoints=kp.ravel().tolist(),
                 handedness="right",
                 timestamp_ns=time.time_ns(),
+                wrist_angle_degrees=12.5,
             )
             time.sleep(0.01)
 
@@ -126,6 +127,7 @@ def test_ingress_server_receives_frames():
             assert isinstance(item, HandLandmarks)
             assert item.keypoints.shape == CANONICAL_LANDMARK_SHAPE
             assert item.handedness == "right"
+            assert item.wrist_angle_degrees == pytest.approx(12.5)
 
     finally:
         channel.close()
@@ -309,6 +311,129 @@ def test_robot_connect_failure_leaves_ready_clear(monkeypatch):
     assert not instances[0].init_called
 
 
+class _ExplodingHand:
+    def __init__(self, model_path=None):
+        self.disabled = False
+        self.disconnected = False
+
+    def connect(self):
+        return True, "ok"
+
+    def init_joints(self):
+        pass
+
+    def set_joint_positions(self, action):
+        raise RuntimeError("OrcaHand.set_joint_positions() failed")
+
+    def disable_torque(self):
+        self.disabled = True
+
+    def disconnect(self):
+        self.disconnected = True
+
+
+class _HomePoseHand:
+    _NEUTRAL = {"wrist": -20.0, "thumb_mcp": 33.0}
+
+    def __init__(self, model_path=None):
+        self.joint_calls: list = []
+
+    def connect(self):
+        return True, "ok"
+
+    def init_joints(self):
+        pass
+
+    def get_joint_position(self):
+        return OrcaJointPositions.from_dict({"wrist": 0.0})
+
+    def set_joint_positions(self, action, num_steps=1):
+        self.joint_calls.append((action, num_steps))
+
+    def set_zero_position(self):
+        pass
+
+    def disable_torque(self):
+        pass
+
+    def disconnect(self):
+        pass
+
+    @property
+    def config(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            joint_ids=list(self._NEUTRAL),
+            type="right",
+            neutral_position=dict(self._NEUTRAL),
+        )
+
+
+def test_orca_hand_sink_go_home(monkeypatch):
+    from types import SimpleNamespace
+
+    instances: list[_HomePoseHand] = []
+
+    def factory(model_path=None):
+        h = _HomePoseHand()
+        instances.append(h)
+        return h
+
+    monkeypatch.setattr("orca_teleop.pipeline.OrcaHand", factory)
+    monkeypatch.setattr(
+        "orca_teleop.pipeline.CameraManager",
+        lambda configs: SimpleNamespace(
+            open=lambda: None,
+            ensure_live=lambda: None,
+            close=lambda: None,
+            shapes={},
+            capture=lambda: {},
+        ),
+    )
+
+    from orca_teleop.pipeline import OrcaHandSink
+
+    sink = OrcaHandSink(model_path="ignored")
+    sink.connect()
+    sink.go_home()
+    sink.close()
+
+    hand = instances[0]
+    assert hand.joint_calls == [({"wrist": 0.0, "thumb_mcp": 33.0}, 1)]
+
+
+def test_orca_hand_sink_go_home_skipped_without_hardware(monkeypatch):
+    from types import SimpleNamespace
+
+    instances: list[_HomePoseHand] = []
+
+    def factory(model_path=None):
+        h = _HomePoseHand()
+        instances.append(h)
+        return h
+
+    monkeypatch.setattr("orca_teleop.pipeline.OrcaHand", factory)
+    monkeypatch.setattr(
+        "orca_teleop.pipeline.CameraManager",
+        lambda configs: SimpleNamespace(
+            open=lambda: None,
+            ensure_live=lambda: None,
+            close=lambda: None,
+            shapes={},
+            capture=lambda: {},
+        ),
+    )
+
+    from orca_teleop.pipeline import OrcaHandSink
+
+    sink = OrcaHandSink(model_path="ignored", connect_hardware=False)
+    sink.connect()
+    sink.go_home()
+
+    assert instances[0].joint_calls == []
+
+
 def test_robot_finally_cleans_up_on_exception(monkeypatch):
     instances: list[_ExplodingHand] = []
 
@@ -413,6 +538,86 @@ def test_retargeter_forwards_joint_positions(monkeypatch):
     assert len(actions) > 0
     for action in actions:
         assert isinstance(action, OrcaJointPositions)
+
+
+def test_retargeter_converts_metaquest_right_hand_landmarks(monkeypatch):
+    captured = {}
+
+    class _StubRetargeter:
+        @classmethod
+        def from_paths(cls, *_args, **_kwargs):
+            return cls()
+
+        def retarget(self, target_pose):
+            captured["keypoints"] = target_pose.joint_positions.copy()
+            return _midpoint_action()
+
+    monkeypatch.setattr("orca_teleop.pipeline.Retargeter", _StubRetargeter)
+
+    keypoints = plausible_hand_keypoints()
+    q = _make_queues()
+    q.landmarks_q.put(
+        HandLandmarks(
+            keypoints=keypoints,
+            handedness="right",
+            timestamp_ns=time.time_ns(),
+        )
+    )
+    q.landmarks_q.put(_SHUTDOWN)
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=retargeter_worker,
+        args=(q, stop),
+        kwargs={"landmark_source": "metaquest"},
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    expected = keypoints.copy()
+    expected[:, 1] *= -1.0
+    np.testing.assert_allclose(captured["keypoints"], expected)
+
+
+def test_retargeter_preserves_webxr_landmarks_and_wrist_angle(monkeypatch):
+    captured = {}
+
+    class _StubRetargeter:
+        @classmethod
+        def from_paths(cls, *_args, **_kwargs):
+            return cls()
+
+        def retarget(self, target_pose):
+            captured["keypoints"] = target_pose.joint_positions.copy()
+            captured["wrist_angle_degrees"] = target_pose.wrist_angle_degrees
+            return _midpoint_action()
+
+    monkeypatch.setattr("orca_teleop.pipeline.Retargeter", _StubRetargeter)
+
+    keypoints = plausible_hand_keypoints()
+    q = _make_queues()
+    q.landmarks_q.put(
+        HandLandmarks(
+            keypoints=keypoints,
+            handedness="right",
+            timestamp_ns=time.time_ns(),
+            wrist_angle_degrees=17.5,
+        )
+    )
+    q.landmarks_q.put(_SHUTDOWN)
+    thread = threading.Thread(
+        target=retargeter_worker,
+        args=(q, threading.Event()),
+        kwargs={"landmark_source": "webxr"},
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    np.testing.assert_allclose(captured["keypoints"], keypoints)
+    assert captured["wrist_angle_degrees"] == pytest.approx(17.5)
 
 
 def test_retargeter_worker_passes_backend_and_config(monkeypatch):

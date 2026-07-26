@@ -17,6 +17,7 @@ from orca_teleop.cameras import (
     OpenCVCameraConfig,
     list_available_cameras,
     parse_camera_spec,
+    with_recording_defaults,
 )
 
 cv2 = pytest.importorskip("cv2")
@@ -59,6 +60,16 @@ def test_parse_spec_missing_name_raises():
 def test_parse_spec_bad_resolution_raises():
     with pytest.raises(ValueError, match="invalid resolution"):
         parse_camera_spec("cam:0:1280")
+
+
+def test_with_recording_defaults_fills_missing_resolution_and_fps():
+    cfg = with_recording_defaults(parse_camera_spec("iphone:1"))
+    assert (cfg.width, cfg.height, cfg.fps) == (640, 480, 30.0)
+
+
+def test_with_recording_defaults_preserves_explicit_values():
+    cfg = with_recording_defaults(parse_camera_spec("iphone:1:1280x720@60"))
+    assert (cfg.width, cfg.height, cfg.fps) == (1280, 720, 60.0)
 
 
 class _FakeCapture:
@@ -211,7 +222,32 @@ def test_camera_manager_empty():
     manager = CameraManager([])
     assert manager.open() == {}
     assert manager.capture() == {}
+    manager.ensure_live()
     manager.close()
+
+
+def test_camera_manager_ensure_live_requires_fresh_frames(monkeypatch):
+    _patch_capture(monkeypatch, width=640, height=480)
+    manager = CameraManager([OpenCVCameraConfig(name="front", index=0)])
+    try:
+        manager.open()
+        manager.ensure_live(samples=3, interval_s=0.0)
+    finally:
+        manager.close()
+
+
+def test_camera_manager_ensure_live_raises_when_stale(monkeypatch):
+    _patch_capture(monkeypatch, width=640, height=480)
+    manager = CameraManager([OpenCVCameraConfig(name="front", index=0)])
+    try:
+        manager.open()
+        # Freeze the freshness clock so the next read looks stale.
+        cam = manager._cameras[0]
+        cam._last_ok_ts = 0.0
+        with pytest.raises(RuntimeError, match="no fresh frame"):
+            manager.ensure_live(samples=1)
+    finally:
+        manager.close()
 
 
 def test_camera_manager_rejects_duplicate_names():
