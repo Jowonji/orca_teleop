@@ -15,6 +15,10 @@ message HandFrame {
 
   // Nanosecond timestamp from the publisher's clock.
   int64 timestamp_ns = 3;
+
+  // Relative wrist flexion from publishers that provide a wrist pose.
+  // Publishers without wrist tracking leave this at zero.
+  float wrist_angle_degrees = 4;
 }
 
 // Configuration sent by the robot when a publisher connects.

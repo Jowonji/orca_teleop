@@ -38,6 +38,7 @@ class HandLandmarks:
     keypoints: np.ndarray  # (21, 3) float32, wrist-relative, meters
     handedness: Literal["left", "right"]
     timestamp_ns: int
+    wrist_angle_degrees: float = 0.0
 
 
 class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
@@ -81,6 +82,7 @@ class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
                     keypoints=keypoints,
                     handedness=handedness,
                     timestamp_ns=frame.timestamp_ns,
+                    wrist_angle_degrees=frame.wrist_angle_degrees,
                 )
 
                 # Always keep the latest frame; drop stale ones.
@@ -123,7 +125,9 @@ class IngressServer:
         max_workers: int = 4,
     ) -> None:
         self._port = port
-        self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
+        self._executor = futures.ThreadPoolExecutor(max_workers=max_workers)
+        self._server = grpc.server(self._executor)
+        self._stopped = False
         servicer = _HandStreamServicer(landmarks_q, stop_event)
         hand_stream_pb2_grpc.add_HandStreamServicer_to_server(servicer, self._server)
 
@@ -136,7 +140,12 @@ class IngressServer:
 
     def stop(self, grace: float = 2.0) -> None:
         """Gracefully shut down the server."""
-        self._server.stop(grace=grace)
+        if self._stopped:
+            return
+        self._stopped = True
+        termination = self._server.stop(grace=grace)
+        termination.wait(timeout=grace + 1.0)
+        self._executor.shutdown(wait=True)
         logger.info("Ingress server stopped")
 
     def wait_for_termination(self, timeout: float | None = None) -> None:

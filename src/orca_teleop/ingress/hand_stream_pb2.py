@@ -14,7 +14,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n%orca_teleop/ingress/hand_stream.proto\x12\x0borca_teleop\"H\n\tHandFrame\x12\x11\n\tkeypoints\x18\x01 \x03(\x02\x12\x12\n\nhandedness\x18\x02 \x01(\t\x12\x14\n\x0ctimestamp_ns\x18\x03 \x01(\x03\"\"\n\x0cStreamConfig\x12\x12\n\nhandedness\x18\x01 \x01(\t\"(\n\rStreamSummary\x12\x17\n\x0f\x66rames_received\x18\x01 \x01(\x03\x32V\n\nHandStream\x12H\n\x10StreamHandFrames\x12\x16.orca_teleop.HandFrame\x1a\x1a.orca_teleop.StreamSummary(\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n%orca_teleop/ingress/hand_stream.proto\x12\x0borca_teleop\"e\n\tHandFrame\x12\x11\n\tkeypoints\x18\x01 \x03(\x02\x12\x12\n\nhandedness\x18\x02 \x01(\t\x12\x14\n\x0ctimestamp_ns\x18\x03 \x01(\x03\x12\x1b\n\x13wrist_angle_degrees\x18\x04 \x01(\x02\"\"\n\x0cStreamConfig\x12\x12\n\nhandedness\x18\x01 \x01(\t\"(\n\rStreamSummary\x12\x17\n\x0f\x66rames_received\x18\x01 \x01(\x03\x32V\n\nHandStream\x12H\n\x10StreamHandFrames\x12\x16.orca_teleop.HandFrame\x1a\x1a.orca_teleop.StreamSummary(\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -22,11 +22,11 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'orca_teleop.ingress.hand_st
 if _descriptor._USE_C_DESCRIPTORS == False:
   DESCRIPTOR._options = None
   _globals['_HANDFRAME']._serialized_start=54
-  _globals['_HANDFRAME']._serialized_end=126
-  _globals['_STREAMCONFIG']._serialized_start=128
-  _globals['_STREAMCONFIG']._serialized_end=162
-  _globals['_STREAMSUMMARY']._serialized_start=164
-  _globals['_STREAMSUMMARY']._serialized_end=204
-  _globals['_HANDSTREAM']._serialized_start=206
-  _globals['_HANDSTREAM']._serialized_end=292
+  _globals['_HANDFRAME']._serialized_end=155
+  _globals['_STREAMCONFIG']._serialized_start=157
+  _globals['_STREAMCONFIG']._serialized_end=191
+  _globals['_STREAMSUMMARY']._serialized_start=193
+  _globals['_STREAMSUMMARY']._serialized_end=233
+  _globals['_HANDSTREAM']._serialized_start=235
+  _globals['_HANDSTREAM']._serialized_end=321
 # @@protoc_insertion_point(module_scope)
