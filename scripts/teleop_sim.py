@@ -61,6 +61,12 @@ def main() -> None:
     )
     parser.add_argument("--show-video", action="store_true", help="Show webcam feed with landmarks")
     parser.add_argument(
+        "--camera",
+        type=int,
+        default=None,
+        help="OpenCV camera index. Default: first device that yields a frame.",
+    )
+    parser.add_argument(
         "--retargeter",
         default="adaptive_analytical",
         choices=["rmsprop", "adaptive_analytical"],
@@ -96,6 +102,7 @@ def main() -> None:
             handedness=args.hand,
             confidence=args.confidence,
             show_video=args.show_video,
+            camera_index=args.camera,
             sink=sink,
             retargeter_backend=args.retargeter,
             retargeter_config_path=args.retarget_config,

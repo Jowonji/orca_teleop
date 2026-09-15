@@ -46,9 +46,13 @@ Example usage:
         --task "wave at the camera" --stub \\
         --camera iphone:1:1280x720@30 --num-episodes 1 --episode-seconds 5
 
-    # Record using a simulated hand
-    python scripts/record_dataset.py --backend sim --repo-id $HF_USERNAME/orca-sim \\
-        --task "pick up the block" --num-episodes 5
+    # Record using a simulated hand + local MediaPipe webcam (RGB auto-selected).
+    # Policy images come from the MuJoCo frontal camera; do not also pass
+    # --camera 6 because that is the same Orbbec RGB node MediaPipe uses.
+    python scripts/record_dataset.py --backend sim --local --source mediapipe --show-video \
+        --repo-id $HF_USERNAME/orca-sim --task "wave and flex fingers" \
+        --urdf-path $ORCAHAND_DESCRIPTION_DIR/v1/models/urdf/orcahand_right.urdf \
+        --episode-end space --num-episodes 5
 
     # Teleop the REAL hand with Manus gloves, ending each episode by pressing SPACE
     # (prerequisite: 'manus-client run' streaming glove data)
@@ -113,9 +117,6 @@ from orca_teleop.utils import RateTicker
 logger = logging.getLogger(__name__)
 
 
-MODEL_PATH = (
-    "/Users/fracapuano/Documents/orca_core/orca_core/models/v2/orcahand_touch_right/config.yaml"
-)
 _DEFAULT_FPS = 30
 _DEFAULT_NUM_EPISODES = 1
 _DEFAULT_EPISODE_SECONDS = 30.0
@@ -364,8 +365,19 @@ def _main_record(argv: list[str]) -> None:
         default=_DEFAULT_FPS,
         help=f"Fixed dataset sampling rate in Hz (default: {_DEFAULT_FPS})",
     )
-    parser.add_argument("--model-path", default=MODEL_PATH, help="OrcaHand model directory")
+    parser.add_argument(
+        "--model-path",
+        default=None,
+        help="OrcaHand model directory. Default: the sim/hardware sink's bundled config.",
+    )
     parser.add_argument("--urdf-path", default=None, help="Hand URDF file")
+    parser.add_argument(
+        "--teleop-camera",
+        type=int,
+        default=None,
+        help="OpenCV index for MediaPipe hand tracking. Default: auto-pick RGB/MJPEG "
+        "(Orbbec Gemini color is usually /dev/video6; do not pass a depth/IR node).",
+    )
     parser.add_argument(
         "--backend",
         choices=["hardware", "sim"],
@@ -479,6 +491,7 @@ def _main_record(argv: list[str]) -> None:
         from orca_teleop.sim import OrcaHandSimSink
 
         sink = OrcaHandSimSink(
+            env_name=args.hand,
             render_mode=SIM_RENDER_MODE,
             camera_configs=camera_configs,
         )
@@ -493,8 +506,74 @@ def _main_record(argv: list[str]) -> None:
                 f"--hand {args.hand!r} does not match the loaded physical OrcaHand "
                 f"model ({sink.handedness!r}). Pass the matching --model-path or --hand."
             )
+    ingress_server: IngressServer | None = None
+    retargeter_thread: threading.Thread | None = None
+    stub_thread: threading.Thread | None = None
+    publisher_process = None
+    quest_reset_event = None
+
+    if not args.stub:
+        # Listen before the slow sim/hardware connect so MediaPipe can open
+        # the RGB camera while MuJoCo is still loading.
+        ingress_server = IngressServer(queues.landmarks_q, stop_event, port=args.port)
+        ingress_server.start()
+        if args.local:
+            import multiprocessing
+
+            ctx = multiprocessing.get_context("spawn")
+            if args.source == "manus":
+                publisher_process = ctx.Process(
+                    target=_manus_publisher,
+                    args=(args.port, args.hand, args.zmq_address),
+                    name="manus-publisher",
+                    daemon=True,
+                )
+            elif args.source == "metaquest":
+                quest_reset_event = ctx.Event()
+                publisher_process = ctx.Process(
+                    target=_metaquest_publisher,
+                    args=(
+                        args.port,
+                        args.hand,
+                        args.quest_host,
+                        args.quest_port,
+                        args.quest_fps,
+                        args.quest_wrist,
+                        args.quest_wrist_scale,
+                        quest_reset_event,
+                    ),
+                    name="metaquest-webxr-publisher",
+                    daemon=True,
+                )
+            else:
+                publisher_process = ctx.Process(
+                    target=_mediapipe_publisher,
+                    args=(
+                        args.port,
+                        args.hand,
+                        DEFAULT_CONFIDENCE,
+                        args.show_video,
+                        args.teleop_camera,
+                    ),
+                    name="mediapipe-publisher",
+                    daemon=True,
+                )
+            publisher_process.start()
+            logger.info(
+                "Local %s publisher started (pid=%d, hand=%s)",
+                args.source,
+                publisher_process.pid,
+                args.hand,
+            )
+
     sink.connect()
     assert isinstance(sink, RecordableSink), "Sinks must be recordable to collect data"
+
+    model_path = args.model_path
+    if model_path is None:
+        model_path = getattr(sink, "retarget_model_path", None)
+        if model_path:
+            logger.info("Using sink-provided retargeter model: %s", model_path)
 
     joint_ids = list(sink.joint_ids)
     n_joints = len(joint_ids)
@@ -528,12 +607,6 @@ def _main_record(argv: list[str]) -> None:
     rec_q: queue.Queue = queue.Queue(maxsize=64)
     episode_finalized_q: queue.Queue[bool] = queue.Queue(maxsize=1)
 
-    ingress_server: IngressServer | None = None
-    retargeter_thread: threading.Thread | None = None
-    stub_thread: threading.Thread | None = None
-    publisher_process = None
-    quest_reset_event = None
-
     if args.stub:
         logger.info(
             "STUB mode — no hardware required; ingress + retargeter bypassed, random "
@@ -546,53 +619,9 @@ def _main_record(argv: list[str]) -> None:
         )
         stub_thread.start()
     else:
-        if args.local:
-            import multiprocessing
-
-            ctx = multiprocessing.get_context("spawn")
-            if args.source == "manus":
-                publisher_process = ctx.Process(
-                    target=_manus_publisher,
-                    args=(args.port, args.hand, args.zmq_address),
-                    name="manus-publisher",
-                    daemon=True,
-                )
-            elif args.source == "metaquest":
-                quest_reset_event = ctx.Event()
-                publisher_process = ctx.Process(
-                    target=_metaquest_publisher,
-                    args=(
-                        args.port,
-                        args.hand,
-                        args.quest_host,
-                        args.quest_port,
-                        args.quest_fps,
-                        args.quest_wrist,
-                        args.quest_wrist_scale,
-                        quest_reset_event,
-                    ),
-                    name="metaquest-webxr-publisher",
-                    daemon=True,
-                )
-            else:
-                publisher_process = ctx.Process(
-                    target=_mediapipe_publisher,
-                    args=(args.port, args.hand, DEFAULT_CONFIDENCE, args.show_video),
-                    name="mediapipe-publisher",
-                    daemon=True,
-                )
-            publisher_process.start()
-            logger.info(
-                "Local %s publisher started (pid=%d, hand=%s)",
-                args.source,
-                publisher_process.pid,
-                args.hand,
-            )
-        ingress_server = IngressServer(queues.landmarks_q, stop_event, port=args.port)
-        ingress_server.start()
         retargeter_thread = threading.Thread(
             target=retargeter_worker,
-            args=(queues, stop_event, args.model_path, args.urdf_path),
+            args=(queues, stop_event, model_path, args.urdf_path),
             kwargs={"landmark_source": ("webxr" if args.source == "metaquest" else "mediapipe")},
             name="retargeter",
         )

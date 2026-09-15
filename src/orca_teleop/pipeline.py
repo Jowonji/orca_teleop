@@ -32,6 +32,7 @@ The retargeter and robot stages run as threads on the robot-side machine.
 
 import logging
 import queue
+import signal
 import socket
 import threading
 import time
@@ -61,6 +62,19 @@ logger = logging.getLogger(__name__)
 
 _SHUTDOWN = object()
 LandmarkSource = Literal["mediapipe", "metaquest", "webxr"]
+
+
+def _install_stop_handler(stop_event: threading.Event) -> Any:
+    """Set SIGINT/SIGTERM to request a clean shutdown instead of hanging in C loops."""
+
+    def _handle(signum: int, _frame: Any) -> None:
+        logger.info("Received signal %s; shutting down.", signal.Signals(signum).name)
+        stop_event.set()
+
+    previous = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, _handle)
+    signal.signal(signal.SIGTERM, _handle)
+    return previous
 
 
 def _shutdown_queue(q: "queue.Queue[Any]") -> None:
@@ -447,15 +461,20 @@ def run(
         landmarks_viz = HandLandmarkVisualizer()
         landmarks_viz.start()
 
+    previous_sigint = _install_stop_handler(stop_event)
+    logger.info("Quit: Ctrl+C in this terminal, q/Esc in the webcam window, or close MuJoCo.")
+
+    # Listen before the slow MuJoCo/sim connect so a local publisher can open
+    # the RGB camera while the viewer is still loading.
+    ingress_server = IngressServer(queues.landmarks_q, stop_event, port=port)
+    ingress_server.start()
+
     sink.connect()
     if model_path is None:
         sink_model_path = getattr(sink, "retarget_model_path", None)
         if sink_model_path:
             model_path = sink_model_path
             logger.info("Using sink-provided retargeter model: %s", model_path)
-
-    ingress_server = IngressServer(queues.landmarks_q, stop_event, port=port)
-    ingress_server.start()
 
     retargeter_thread = threading.Thread(
         target=retargeter_worker,
@@ -476,7 +495,7 @@ def run(
     try:
         sink.run_loop(queues.actions_q, stop_event)
     except KeyboardInterrupt:
-        pass
+        stop_event.set()
     finally:
         stop_event.set()
         ingress_server.stop()
@@ -484,6 +503,7 @@ def run(
         sink.close()
         if landmarks_viz is not None:
             landmarks_viz.stop()
+        signal.signal(signal.SIGINT, previous_sigint)
 
 
 def _mediapipe_publisher(
@@ -491,14 +511,26 @@ def _mediapipe_publisher(
     handedness: str,
     confidence: float,
     show_video: bool,
+    camera_index: int | None = None,
 ) -> None:
     """Entry point for the MediaPipe publisher."""
     from orca_teleop.ingress.mediapipe.publisher import MediaPipePublisher
 
-    server_address = f"localhost:{port}"
-    deadline = time.monotonic() + 10.0
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
 
-    # Wait until the ingress server is actually accepting connections
+    # Let the parent process own Ctrl+C so this child can be terminated cleanly.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    server_address = f"localhost:{port}"
+    deadline = time.monotonic() + 180.0
+
+    # Wait until the ingress server is actually accepting connections.
+    # MuJoCo on WSL/llvmpipe can take well over 10s to come up.
     while True:
         try:
             with socket.create_connection(tuple(server_address.split(":")), timeout=0.5):
@@ -508,13 +540,14 @@ def _mediapipe_publisher(
                 raise RuntimeError(
                     f"Ingress server on {server_address} did not become ready"
                 ) from err
-            time.sleep(0.1)
+            time.sleep(0.2)
 
     publisher = MediaPipePublisher(
         server_address=server_address,
         handedness=handedness,
         confidence=confidence,
         show_video=show_video,
+        camera_index=camera_index,
     )
     publisher.run()
 
@@ -570,16 +603,20 @@ def run_local(
     visualize_landmarks: bool = False,
     retargeter_backend: RetargeterBackend = "adaptive_analytical",
     retargeter_config_path: str | None = None,
+    camera_index: int | None = None,
 ) -> None:
     """Run ``run()`` plus a local MediaPipe publisher for one-command teleop.
     Useful for prototyping.
     """
     import multiprocessing
 
-    # Start the publisher in a child process so the webcam doesn't fight with main thread
-    publisher_process = multiprocessing.Process(
+    # Spawn a fresh interpreter so OpenCV/Qt can create a window. Forked
+    # children on WSL often never show cv2.imshow. The child keeps scanning
+    # camera indices until a device actually yields a frame.
+    ctx = multiprocessing.get_context("spawn")
+    publisher_process = ctx.Process(
         target=_mediapipe_publisher,
-        args=(port, handedness, confidence, show_video),
+        args=(port, handedness, confidence, show_video, camera_index),
         name="mediapipe-publisher",
         daemon=True,
     )
@@ -604,7 +641,10 @@ def run_local(
     finally:
         if publisher_process.is_alive():
             publisher_process.terminate()
-        publisher_process.join(timeout=3.0)
+            publisher_process.join(timeout=2.0)
+        if publisher_process.is_alive():
+            publisher_process.kill()
+            publisher_process.join(timeout=1.0)
 
 
 def _manus_publisher(

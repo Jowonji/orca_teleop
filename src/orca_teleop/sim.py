@@ -62,6 +62,10 @@ class SimCameraConfig:
     name: str = "frontal"
     width: int = 320
     height: int = 240
+    # Shadows and floor reflections are off by default: they cost ~250 ms per
+    # frame under software GL and are invisible at this resolution anyway.
+    # Only the recorded observation is affected, never the operator's viewer.
+    shadows: bool = False
 
 
 class OrcaHandSimSink(RecordableSink):
@@ -134,6 +138,11 @@ class OrcaHandSimSink(RecordableSink):
             height=self._camera_config.height,
             width=self._camera_config.width,
         )
+        if not self._camera_config.shadows:
+            # ``mjv_updateScene`` preserves these, so setting them once here is enough.
+            scene_flags = self._renderer.scene.flags
+            scene_flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
+            scene_flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
         self._record_camera = mujoco.MjvCamera()
         mujoco.mjv_defaultFreeCamera(env.model, self._record_camera)
 
@@ -221,6 +230,11 @@ class OrcaHandSimSink(RecordableSink):
         ticker = RateTicker(dt=self._dt)
 
         while not stop_event.is_set():
+            viewer = getattr(self._env, "_viewer", None)
+            if viewer is not None and hasattr(viewer, "is_running") and not viewer.is_running():
+                logger.info("MuJoCo viewer closed; stopping sim loop.")
+                break
+
             shutdown_received = False
             try:
                 item = actions_q.get_nowait()

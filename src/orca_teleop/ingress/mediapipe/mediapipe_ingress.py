@@ -73,9 +73,9 @@ class MediaPipeIngress:
         )
         self.landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
 
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            raise RuntimeError("Failed to open webcam")
+        from orca_teleop.ingress.mediapipe.publisher import open_webcam
+
+        self.cap = open_webcam()
 
         self.latest_frame = None
         self.latest_image_landmarks = None
@@ -83,6 +83,7 @@ class MediaPipeIngress:
         self.frame_lock = threading.Lock()
         self.running = False
         self.livestream_thread = None
+        self._mp_timestamp_ms = 0
 
     def _result_callback(self, result, _output_image, _timestamp_ms: int):
         """Process MediaPipe results."""
@@ -148,7 +149,9 @@ class MediaPipeIngress:
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-            self.landmarker.detect_async(mp_image, int(time.time() * 1000))
+            timestamp_ms = max(self._mp_timestamp_ms + 1, int(time.time() * 1000))
+            self._mp_timestamp_ms = timestamp_ms
+            self.landmarker.detect_async(mp_image, timestamp_ms)
             time.sleep(1.0 / 30.0)
 
     def start(self):
