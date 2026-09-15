@@ -135,5 +135,7 @@ robot_frames_by_version:
 joint_name_aliases:
   right:
     thumb_pip: thumb_cmc
+    thumb_cmc: thumb_pip
   left:
     thumb_pip: thumb_cmc
+    thumb_cmc: thumb_pip
