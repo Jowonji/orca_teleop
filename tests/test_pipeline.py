@@ -128,7 +128,36 @@ def test_ingress_server_receives_frames():
             assert item.keypoints.shape == CANONICAL_LANDMARK_SHAPE
             assert item.handedness == "right"
             assert item.wrist_angle_degrees == pytest.approx(12.5)
+            assert item.wrist_image is None
 
+    finally:
+        channel.close()
+        server.stop()
+
+
+def test_ingress_server_accepts_wrist_image_hint():
+    q = queue.Queue(maxsize=8)
+    stop = threading.Event()
+    server = IngressServer(q, stop, port=0)
+    port = server.start()
+    channel = grpc.insecure_channel(f"localhost:{port}")
+    stub = hand_stream_pb2_grpc.HandStreamStub(channel)
+    kp = plausible_hand_keypoints().astype(np.float32)
+    hint = np.array([0.41, 0.52, 0.13], dtype=np.float32)
+
+    def gen_frames():
+        yield hand_stream_pb2.HandFrame(
+            keypoints=kp.ravel().tolist() + hint.tolist(),
+            handedness="right",
+            timestamp_ns=time.time_ns(),
+        )
+
+    try:
+        response = stub.StreamHandFrames(gen_frames())
+        assert response.frames_received == 1
+        item = q.get(timeout=1.0)
+        assert item.keypoints.shape == CANONICAL_LANDMARK_SHAPE
+        np.testing.assert_allclose(item.wrist_image, hint)
     finally:
         channel.close()
         server.stop()
@@ -698,3 +727,31 @@ def test_retargeter_skips_none_actions(monkeypatch):
             break
 
     assert items == [_SHUTDOWN]
+
+
+def test_retargeter_worker_calls_landmark_hook(monkeypatch):
+    seen = []
+
+    class _StubRetargeter:
+        @classmethod
+        def from_paths(cls, *_args, **_kwargs):
+            return cls()
+
+        def retarget(self, _target_pose):
+            return _midpoint_action()
+
+    monkeypatch.setattr("orca_teleop.pipeline.Retargeter", _StubRetargeter)
+    q = _make_queues()
+    landmark = _make_landmark()
+    q.landmarks_q.put(landmark)
+    q.landmarks_q.put(_SHUTDOWN)
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=retargeter_worker,
+        args=(q, stop),
+        kwargs={"landmark_hook": seen.append},
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=2.0)
+    assert seen == [landmark]
