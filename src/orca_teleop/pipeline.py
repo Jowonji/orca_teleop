@@ -279,6 +279,7 @@ def retargeter_worker(
     retargeter_config_path: str | None = None,
     landmarks_viz: Any | None = None,
     landmark_source: LandmarkSource = "mediapipe",
+    landmark_hook: Any | None = None,
 ) -> None:
     """Consume ``HandLandmarks`` from the gRPC ingress, retarget, push to actions_q.
 
@@ -321,6 +322,12 @@ def retargeter_worker(
 
             if not isinstance(item, HandLandmarks):
                 raise ValueError(f"Expected instance of HandLandmarks, got {type(item)}")
+
+            if landmark_hook is not None:
+                try:
+                    landmark_hook(item)
+                except Exception:
+                    logger.debug("landmark_hook failed", exc_info=True)
 
             keypoints = item.keypoints
             if landmark_source == "metaquest":
@@ -488,6 +495,7 @@ def run(
             landmarks_viz,
             landmark_source,
         ),
+        kwargs={"landmark_hook": getattr(sink, "update_arm_hint", None)},
         name="retargeter",
     )
     retargeter_thread.start()

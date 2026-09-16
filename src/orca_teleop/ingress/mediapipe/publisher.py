@@ -349,6 +349,7 @@ class MediaPipePublisher:
         # Latest frame data (written by callback, read by stream generator)
         self._lock = threading.Lock()
         self._latest_keypoints: np.ndarray | None = None
+        self._latest_wrist_image: np.ndarray | None = None
         self._fresh = False
 
         # Visualization state
@@ -368,12 +369,19 @@ class MediaPipePublisher:
 
         world_landmarks = result.hand_world_landmarks[0]
         keypoints = np.array([[lm.x, lm.y, lm.z] for lm in world_landmarks], dtype=np.float32)
+        image_landmarks = result.hand_landmarks[0]
+        wrist = image_landmarks[0]
+        index_mcp = image_landmarks[5]
+        pinky_mcp = image_landmarks[17]
+        palm_w = float(np.hypot(index_mcp.x - pinky_mcp.x, index_mcp.y - pinky_mcp.y))
+        wrist_image = np.array([wrist.x, wrist.y, palm_w], dtype=np.float32)
 
         with self._lock:
             self._latest_keypoints = keypoints
+            self._latest_wrist_image = wrist_image
             self._fresh = True
             if self._show_video:
-                self._latest_image_landmarks = result.hand_landmarks[0]
+                self._latest_image_landmarks = image_landmarks
 
     def _frame_generator(self):
         """Yield HandFrame protos as fast as new data arrives."""
@@ -381,16 +389,25 @@ class MediaPipePublisher:
             with self._lock:
                 if not self._fresh:
                     kp = None
+                    wrist = None
                 else:
                     kp = self._latest_keypoints.copy()
+                    wrist = (
+                        None
+                        if self._latest_wrist_image is None
+                        else self._latest_wrist_image.copy()
+                    )
                     self._fresh = False
 
             if kp is None:
                 time.sleep(0.001)
                 continue
 
+            packed = kp.ravel().tolist()
+            if wrist is not None:
+                packed.extend(wrist.tolist())
             yield hand_stream_pb2.HandFrame(
-                keypoints=kp.ravel().tolist(),
+                keypoints=packed,
                 handedness=self._handedness,
                 timestamp_ns=time.time_ns(),
             )

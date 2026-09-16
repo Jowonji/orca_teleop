@@ -54,6 +54,15 @@ Example usage:
         --urdf-path $ORCAHAND_DESCRIPTION_DIR/v1/models/urdf/orcahand_right.urdf \
         --episode-end space --num-episodes 5
 
+    # Combined Nero arm (rest hold) + Orca fingers on nero_orca MJCF.
+    python scripts/record_dataset.py --backend combined --local --source mediapipe --show-video \
+        --overwrite --fps 15 --episode-end space --num-episodes 5 \
+        --urdf-path $ORCAHAND_DESCRIPTION_DIR/v1/models/urdf/orcahand_right.urdf \
+        --repo-id keti/nero-orca-sim-mediapipe \
+        --task "wave and flex fingers, arm at rest" \
+        --root $HOME/workspace/nero_orca/datasets/nero-orca-sim-mediapipe
+
+
     # Teleop the REAL hand with Manus gloves, ending each episode by pressing SPACE
     # (prerequisite: 'manus-client run' streaming glove data)
     python scripts/record_dataset.py --repo-id $HF_USERNAME/orca-manus \\
@@ -380,9 +389,10 @@ def _main_record(argv: list[str]) -> None:
     )
     parser.add_argument(
         "--backend",
-        choices=["hardware", "sim"],
+        choices=["hardware", "sim", "combined"],
         default="hardware",
-        help="Backend to record against (default: hardware).",
+        help="Backend to record against (default: hardware). "
+        "'combined' loads nero_orca MJCF (Nero rest + Orca fingers).",
     )
     parser.add_argument(
         "--port",
@@ -487,7 +497,20 @@ def _main_record(argv: list[str]) -> None:
 
     # Sinks own and composes the full observation
     camera_configs = _parse_camera_configs(args.camera)
-    if args.backend == "sim":
+    if args.backend == "combined":
+        if args.hand != "right":
+            parser.error("--backend combined is the right-hand Nero+Orca model only.")
+        nero_orca = Path(__file__).resolve().parents[2] / "nero_orca"
+        if not (nero_orca / "sim_sink.py").exists():
+            parser.error(f"combined backend needs {nero_orca / 'sim_sink.py'}")
+        sys.path.insert(0, str(nero_orca))
+        from sim_sink import CombinedNeroOrcaSimSink
+
+        sink = CombinedNeroOrcaSimSink(
+            camera_configs=camera_configs,
+            control_hz=float(args.fps),
+        )
+    elif args.backend == "sim":
         from orca_teleop.sim import OrcaHandSimSink
 
         sink = OrcaHandSimSink(
@@ -622,7 +645,10 @@ def _main_record(argv: list[str]) -> None:
         retargeter_thread = threading.Thread(
             target=retargeter_worker,
             args=(queues, stop_event, model_path, args.urdf_path),
-            kwargs={"landmark_source": ("webxr" if args.source == "metaquest" else "mediapipe")},
+            kwargs={
+                "landmark_source": ("webxr" if args.source == "metaquest" else "mediapipe"),
+                "landmark_hook": getattr(sink, "update_arm_hint", None),
+            },
             name="retargeter",
         )
         retargeter_thread.start()
@@ -740,7 +766,10 @@ def _main_record(argv: list[str]) -> None:
                     ticker.tick()
                     continue
 
-                action_arr = action.as_array(joint_ids).astype(np.float32)
+                if hasattr(sink, "dataset_action"):
+                    action_arr = np.asarray(sink.dataset_action(action), dtype=np.float32)
+                else:
+                    action_arr = action.as_array(joint_ids).astype(np.float32)
 
                 try:
                     observation = sink.get_observation()

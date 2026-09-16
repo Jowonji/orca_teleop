@@ -26,6 +26,8 @@ import grpc
 import numpy as np
 
 from orca_teleop.constants import _COORDS_PER_POINT, _EXPECTED_LEN, _NUM_KEYPOINTS, DEFAULT_PORT
+
+_ARM_HINT_LEN = 3
 from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,7 @@ class HandLandmarks:
     handedness: Literal["left", "right"]
     timestamp_ns: int
     wrist_angle_degrees: float = 0.0
+    wrist_image: np.ndarray | None = None  # (3,) image x, y, palm_width; MediaPipe only
 
 
 class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
@@ -62,11 +65,22 @@ class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
                 if self._stop.is_set():
                     break
 
-                if len(frame.keypoints) != _EXPECTED_LEN:
+                n = len(frame.keypoints)
+                wrist_image = None
+                if n == _EXPECTED_LEN + _ARM_HINT_LEN:
+                    raw = np.array(frame.keypoints, dtype=np.float32)
+                    keypoints = raw[:_EXPECTED_LEN].reshape(_NUM_KEYPOINTS, _COORDS_PER_POINT)
+                    wrist_image = raw[_EXPECTED_LEN:]
+                elif n == _EXPECTED_LEN:
+                    keypoints = np.array(frame.keypoints, dtype=np.float32).reshape(
+                        _NUM_KEYPOINTS, _COORDS_PER_POINT
+                    )
+                else:
                     logger.warning(
-                        "Dropping frame: expected %d floats, got %d",
+                        "Dropping frame: expected %d or %d floats, got %d",
                         _EXPECTED_LEN,
-                        len(frame.keypoints),
+                        _EXPECTED_LEN + _ARM_HINT_LEN,
+                        n,
                     )
                     continue
 
@@ -75,14 +89,12 @@ class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
                     logger.warning("Dropping frame: invalid handedness %r", frame.handedness)
                     continue
 
-                keypoints = np.array(frame.keypoints, dtype=np.float32).reshape(
-                    _NUM_KEYPOINTS, _COORDS_PER_POINT
-                )
                 landmark = HandLandmarks(
                     keypoints=keypoints,
                     handedness=handedness,
                     timestamp_ns=frame.timestamp_ns,
                     wrist_angle_degrees=frame.wrist_angle_degrees,
+                    wrist_image=wrist_image,
                 )
 
                 # Always keep the latest frame; drop stale ones.
