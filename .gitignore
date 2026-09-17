@@ -196,3 +196,6 @@ cython_debug/
 .vscode
 # Local recorded sessions (do not commit)
 datasets/
+
+# Orbbec SDK runtime logs
+Log/

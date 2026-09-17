@@ -163,6 +163,38 @@ def test_ingress_server_accepts_wrist_image_hint():
         server.stop()
 
 
+def test_ingress_server_accepts_depth_wrist_hint():
+    q = queue.Queue(maxsize=8)
+    stop = threading.Event()
+    server = IngressServer(q, stop, port=0)
+    port = server.start()
+    channel = grpc.insecure_channel(f"localhost:{port}")
+    stub = hand_stream_pb2_grpc.HandStreamStub(channel)
+    kp = plausible_hand_keypoints().astype(np.float32)
+    hints = [
+        np.array([0.41, 0.52, 0.13, 0.05, -0.02, 0.61], dtype=np.float32),
+        np.array([0.41, 0.52, 0.13, np.nan, np.nan, np.nan], dtype=np.float32),
+    ]
+
+    def gen_frames():
+        for hint in hints:
+            yield hand_stream_pb2.HandFrame(
+                keypoints=kp.ravel().tolist() + hint.tolist(),
+                handedness="right",
+                timestamp_ns=time.time_ns(),
+            )
+
+    try:
+        response = stub.StreamHandFrames(gen_frames())
+        assert response.frames_received == 2
+        for hint in hints:
+            item = q.get(timeout=1.0)
+            np.testing.assert_allclose(item.wrist_image, hint)
+    finally:
+        channel.close()
+        server.stop()
+
+
 def test_ingress_server_drops_stale_on_full_queue():
     """When the queue is full, server drops oldest and enqueues latest."""
     n_frames = 5
