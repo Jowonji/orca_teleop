@@ -22,7 +22,7 @@ Usage::
     python -m orca_teleop.ingress.mediapipe.publisher --depth webcam
 
 With an Orbbec camera and ``pyorbbecsdk2`` installed (``--depth auto``, the
-default), the wrist hint gains a metric palm point: ``x, y, palm_width, X, Y, Z``
+default), the wrist position gains a metric palm point: ``x, y, palm_width, X, Y, Z``
 with X/Y/Z in meters in the color camera frame (NaN when depth is missing).
 ``--depth off`` keeps the Orbbec capture path (same frames and rate) and sends
 only ``x, y, palm_width``, so the two arm modes can be compared like for like.
@@ -50,7 +50,7 @@ from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
 from orca_teleop.ingress.mediapipe.orbbec import OrbbecRGBDCamera, open_orbbec
 
 # auto: Orbbec depth if present; orbbec: require it; off: Orbbec color only (3-value
-# hint); webcam: OpenCV webcam, never the Orbbec SDK.
+# wrist position); webcam: OpenCV webcam, never the Orbbec SDK.
 DEPTH_MODES = ("auto", "orbbec", "off", "webcam")
 _DEPTH_CACHE = 8  # depth maps kept for matching async MediaPipe results by timestamp
 
@@ -380,7 +380,7 @@ class MediaPipePublisher:
         # Latest frame data (written by callback, read by stream generator)
         self._lock = threading.Lock()
         self._latest_keypoints: np.ndarray | None = None
-        self._latest_wrist_image: np.ndarray | None = None
+        self._latest_wrist_position: np.ndarray | None = None
         self._fresh = False
 
         # Visualization state
@@ -406,7 +406,7 @@ class MediaPipePublisher:
         index_mcp = image_landmarks[5]
         pinky_mcp = image_landmarks[17]
         palm_w = float(np.hypot(index_mcp.x - pinky_mcp.x, index_mcp.y - pinky_mcp.y))
-        wrist_image = np.array([wrist.x, wrist.y, palm_w], dtype=np.float32)
+        wrist_position = np.array([wrist.x, wrist.y, palm_w], dtype=np.float32)
 
         palm_xyz = None
         if self._rgbd is not None and self._send_depth:
@@ -415,11 +415,11 @@ class MediaPipePublisher:
             if depth_m is not None:
                 palm_xyz = self._rgbd.palm_point(depth_m, image_landmarks)
             nan3 = np.full(3, np.nan, dtype=np.float32)
-            wrist_image = np.concatenate([wrist_image, nan3 if palm_xyz is None else palm_xyz])
+            wrist_position = np.concatenate([wrist_position, nan3 if palm_xyz is None else palm_xyz])
 
         with self._lock:
             self._latest_keypoints = keypoints
-            self._latest_wrist_image = wrist_image
+            self._latest_wrist_position = wrist_position
             self._fresh = True
             if self._show_video:
                 self._latest_image_landmarks = image_landmarks
@@ -436,8 +436,8 @@ class MediaPipePublisher:
                     kp = self._latest_keypoints.copy()
                     wrist = (
                         None
-                        if self._latest_wrist_image is None
-                        else self._latest_wrist_image.copy()
+                        if self._latest_wrist_position is None
+                        else self._latest_wrist_position.copy()
                     )
                     self._fresh = False
 

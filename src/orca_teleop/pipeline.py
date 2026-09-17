@@ -495,7 +495,7 @@ def run(
             landmarks_viz,
             landmark_source,
         ),
-        kwargs={"landmark_hook": getattr(sink, "update_arm_hint", None)},
+        kwargs={"landmark_hook": getattr(sink, "update_wrist_position", None)},
         name="retargeter",
     )
     retargeter_thread.start()

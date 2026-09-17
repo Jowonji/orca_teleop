@@ -657,7 +657,7 @@ def _main_record(argv: list[str]) -> None:
             args=(queues, stop_event, model_path, args.urdf_path),
             kwargs={
                 "landmark_source": ("webxr" if args.source == "metaquest" else "mediapipe"),
-                "landmark_hook": getattr(sink, "update_arm_hint", None),
+                "landmark_hook": getattr(sink, "update_wrist_position", None),
             },
             name="retargeter",
         )
