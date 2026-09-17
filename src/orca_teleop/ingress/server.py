@@ -27,7 +27,8 @@ import numpy as np
 
 from orca_teleop.constants import _COORDS_PER_POINT, _EXPECTED_LEN, _NUM_KEYPOINTS, DEFAULT_PORT
 
-_ARM_HINT_LEN = 3
+# MediaPipe wrist hint: image x, y, palm_width [+ palm X, Y, Z meters from RGB-D].
+_ARM_HINT_LENS = (3, 6)
 from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,8 @@ class HandLandmarks:
     handedness: Literal["left", "right"]
     timestamp_ns: int
     wrist_angle_degrees: float = 0.0
-    wrist_image: np.ndarray | None = None  # (3,) image x, y, palm_width; MediaPipe only
+    # (3,) image x, y, palm_width, or (6,) with camera-frame palm X, Y, Z (m, NaN if no depth).
+    wrist_image: np.ndarray | None = None  # MediaPipe only
 
 
 class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
@@ -67,7 +69,7 @@ class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
 
                 n = len(frame.keypoints)
                 wrist_image = None
-                if n == _EXPECTED_LEN + _ARM_HINT_LEN:
+                if n - _EXPECTED_LEN in _ARM_HINT_LENS:
                     raw = np.array(frame.keypoints, dtype=np.float32)
                     keypoints = raw[:_EXPECTED_LEN].reshape(_NUM_KEYPOINTS, _COORDS_PER_POINT)
                     wrist_image = raw[_EXPECTED_LEN:]
@@ -77,9 +79,9 @@ class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
                     )
                 else:
                     logger.warning(
-                        "Dropping frame: expected %d or %d floats, got %d",
+                        "Dropping frame: expected %d (+%s hint) floats, got %d",
                         _EXPECTED_LEN,
-                        _EXPECTED_LEN + _ARM_HINT_LEN,
+                        "/".join(str(k) for k in _ARM_HINT_LENS),
                         n,
                     )
                     continue

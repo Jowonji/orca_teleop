@@ -14,6 +14,18 @@ Usage::
 
     # Left hand, high confidence
     python -m orca_teleop.ingress.mediapipe.publisher --hand left --confidence 0.9
+
+    # Image-cue baseline: same Orbbec color stream, but no metric palm point
+    python -m orca_teleop.ingress.mediapipe.publisher --depth off
+
+    # Plain OpenCV webcam even when an Orbbec RGB-D camera is attached
+    python -m orca_teleop.ingress.mediapipe.publisher --depth webcam
+
+With an Orbbec camera and ``pyorbbecsdk2`` installed (``--depth auto``, the
+default), the wrist hint gains a metric palm point: ``x, y, palm_width, X, Y, Z``
+with X/Y/Z in meters in the color camera frame (NaN when depth is missing).
+``--depth off`` keeps the Orbbec capture path (same frames and rate) and sends
+only ``x, y, palm_width``, so the two arm modes can be compared like for like.
 """
 
 from __future__ import annotations
@@ -21,10 +33,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import cv2
@@ -33,6 +47,12 @@ import mediapipe as mp
 import numpy as np
 
 from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
+from orca_teleop.ingress.mediapipe.orbbec import OrbbecRGBDCamera, open_orbbec
+
+# auto: Orbbec depth if present; orbbec: require it; off: Orbbec color only (3-value
+# hint); webcam: OpenCV webcam, never the Orbbec SDK.
+DEPTH_MODES = ("auto", "orbbec", "off", "webcam")
+_DEPTH_CACHE = 8  # depth maps kept for matching async MediaPipe results by timestamp
 
 _HAND_CONNECTIONS = [
     (0, 1),
@@ -327,6 +347,10 @@ def open_webcam(
         time.sleep(interval)
 
 
+def _raise_keyboard_interrupt(_signum, _frame) -> None:
+    raise KeyboardInterrupt
+
+
 class MediaPipePublisher:
     """Captures hand landmarks from a webcam and streams them over gRPC."""
 
@@ -337,7 +361,10 @@ class MediaPipePublisher:
         confidence: float = 0.7,
         show_video: bool = False,
         camera_index: int | None = None,
+        depth: str = "auto",
     ) -> None:
+        if depth not in DEPTH_MODES:
+            raise ValueError(f"depth must be one of {DEPTH_MODES} (got {depth!r})")
         self._server_address = server_address
         self._handedness = handedness.lower()
         self._confidence = confidence
@@ -345,6 +372,10 @@ class MediaPipePublisher:
         self._camera_index = camera_index
         self._landmarker = None
         self._capture_fourcc = ""
+        self._depth_mode = depth
+        self._send_depth = depth in {"auto", "orbbec"}
+        self._rgbd: OrbbecRGBDCamera | None = None
+        self._depth_by_ts: OrderedDict[int, np.ndarray] = OrderedDict()
 
         # Latest frame data (written by callback, read by stream generator)
         self._lock = threading.Lock()
@@ -355,9 +386,10 @@ class MediaPipePublisher:
         # Visualization state
         self._latest_frame: np.ndarray | None = None
         self._latest_image_landmarks = None
+        self._latest_palm_xyz: np.ndarray | None = None
         self._mp_timestamp_ms = 0
 
-    def _on_result(self, result, _output_image, _timestamp_ms: int) -> None:
+    def _on_result(self, result, _output_image, timestamp_ms: int) -> None:
         """MediaPipe async callback — fires on each detection."""
         if not result.hand_landmarks:
             return
@@ -376,12 +408,22 @@ class MediaPipePublisher:
         palm_w = float(np.hypot(index_mcp.x - pinky_mcp.x, index_mcp.y - pinky_mcp.y))
         wrist_image = np.array([wrist.x, wrist.y, palm_w], dtype=np.float32)
 
+        palm_xyz = None
+        if self._rgbd is not None and self._send_depth:
+            with self._lock:
+                depth_m = self._depth_by_ts.get(timestamp_ms)
+            if depth_m is not None:
+                palm_xyz = self._rgbd.palm_point(depth_m, image_landmarks)
+            nan3 = np.full(3, np.nan, dtype=np.float32)
+            wrist_image = np.concatenate([wrist_image, nan3 if palm_xyz is None else palm_xyz])
+
         with self._lock:
             self._latest_keypoints = keypoints
             self._latest_wrist_image = wrist_image
             self._fresh = True
             if self._show_video:
                 self._latest_image_landmarks = image_landmarks
+                self._latest_palm_xyz = palm_xyz
 
     def _frame_generator(self):
         """Yield HandFrame protos as fast as new data arrives."""
@@ -429,11 +471,21 @@ class MediaPipePublisher:
 
     def run(self) -> None:
         """Open the webcam, connect to the server, and stream until interrupted."""
-        # Grab V4L2 before MediaPipe creates an EGL context; otherwise WSL
+        # Grab the camera before MediaPipe creates an EGL context; otherwise WSL
         # camera probing often fails to see /dev/video2.
-        logger.info("Searching for RGB/MJPEG camera (will keep retrying until one opens)")
-        cap = open_webcam(self._camera_index, retry=True)
-        self._capture_fourcc = _fourcc_str(cap)
+        cap = None
+        if threading.current_thread() is threading.main_thread():
+            # record_dataset terminates the publisher process; unwind so the camera is
+            # stopped cleanly (an Orbbec pipeline left running stalls the next start).
+            signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+        if self._depth_mode != "webcam":
+            self._rgbd = open_orbbec()
+            if self._rgbd is None and self._depth_mode == "orbbec":
+                raise RuntimeError("--depth orbbec requested but no Orbbec RGB-D camera opened")
+        if self._rgbd is None:
+            logger.info("Searching for RGB/MJPEG camera (will keep retrying until one opens)")
+            cap = open_webcam(self._camera_index, retry=True)
+            self._capture_fourcc = _fourcc_str(cap)
         self._create_landmarker()
         if self._show_video:
             self._show_video = _prepare_opencv_gui()
@@ -453,20 +505,33 @@ class MediaPipePublisher:
         try:
             missed = 0
             while True:
-                ret, frame = cap.read()
-                if not ret:
-                    missed += 1
-                    if missed >= 15:
-                        logger.warning("Webcam dropped frames; searching again")
-                        cap.release()
-                        cap = open_webcam(self._camera_index, retry=True)
-                        self._capture_fourcc = _fourcc_str(cap)
-                        missed = 0
-                    time.sleep(0.05)
-                    continue
-                missed = 0
+                depth_m = None
+                if self._rgbd is not None:
+                    ret, frame_rgb, depth_m = self._rgbd.read()
+                    if not ret:
+                        missed += 1
+                        if missed == 15:
+                            logger.warning("Orbbec camera stopped delivering color+depth frames")
+                        continue
+                    missed = 0
+                    frame_bgr = (
+                        cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR) if self._show_video else None
+                    )
+                else:
+                    ret, frame = cap.read()
+                    if not ret:
+                        missed += 1
+                        if missed >= 15:
+                            logger.warning("Webcam dropped frames; searching again")
+                            cap.release()
+                            cap = open_webcam(self._camera_index, retry=True)
+                            self._capture_fourcc = _fourcc_str(cap)
+                            missed = 0
+                        time.sleep(0.05)
+                        continue
+                    missed = 0
+                    frame_bgr, frame_rgb = frame_to_bgr_rgb(frame, self._capture_fourcc)
 
-                frame_bgr, frame_rgb = frame_to_bgr_rgb(frame, self._capture_fourcc)
                 if self._show_video:
                     with self._lock:
                         self._latest_frame = frame_bgr
@@ -474,6 +539,11 @@ class MediaPipePublisher:
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
                 timestamp_ms = max(self._mp_timestamp_ms + 1, int(time.time() * 1000))
                 self._mp_timestamp_ms = timestamp_ms
+                if depth_m is not None and self._send_depth:
+                    with self._lock:
+                        self._depth_by_ts[timestamp_ms] = depth_m
+                        while len(self._depth_by_ts) > _DEPTH_CACHE:
+                            self._depth_by_ts.popitem(last=False)
                 self._landmarker.detect_async(mp_image, timestamp_ms)
 
                 if self._show_video:
@@ -483,14 +553,18 @@ class MediaPipePublisher:
                 if key in {ord("q"), 27}:  # q or Esc
                     break
 
-                time.sleep(1.0 / 30.0)
+                if self._rgbd is None:
+                    time.sleep(1.0 / 30.0)  # the Orbbec read already blocks on the next frame
 
         except KeyboardInterrupt:
             pass
         finally:
             stream_future.cancel()
             channel.close()
-            cap.release()
+            if cap is not None:
+                cap.release()
+            if self._rgbd is not None:
+                self._rgbd.release()
             if self._landmarker is not None:
                 self._landmarker.close()
             if self._show_video:
@@ -504,9 +578,19 @@ class MediaPipePublisher:
                 return
             frame = self._latest_frame.copy()
             image_landmarks = self._latest_image_landmarks
+            palm_xyz = self._latest_palm_xyz
 
         if image_landmarks:
             _draw_hand_landmarks(frame, image_landmarks)
+        if self._rgbd is not None:
+            label = (
+                "depth: off (image cue)"
+                if not self._send_depth
+                else "depth: --"
+                if palm_xyz is None
+                else f"palm X={palm_xyz[0]:+.2f} Y={palm_xyz[1]:+.2f} Z={palm_xyz[2]:.2f} m"
+            )
+            cv2.putText(frame, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         cv2.imshow(WINDOW_NAME, frame)
 
@@ -544,6 +628,15 @@ def main() -> None:
         help="OpenCV camera index. Default: first device that yields a frame.",
     )
     parser.add_argument(
+        "--depth",
+        default="auto",
+        choices=DEPTH_MODES,
+        help="Metric palm position from an Orbbec RGB-D camera. 'auto' (default) uses it "
+        "when pyorbbecsdk2 finds one and otherwise falls back to the OpenCV webcam; "
+        "'orbbec' requires it; 'off' keeps the Orbbec color stream but sends only the "
+        "image cue (baseline); 'webcam' forces the OpenCV webcam.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -562,6 +655,7 @@ def main() -> None:
         confidence=args.confidence,
         show_video=args.show_video,
         camera_index=args.camera,
+        depth=args.depth,
     )
     publisher.run()
 
