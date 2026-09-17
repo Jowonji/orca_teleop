@@ -128,14 +128,14 @@ def test_ingress_server_receives_frames():
             assert item.keypoints.shape == CANONICAL_LANDMARK_SHAPE
             assert item.handedness == "right"
             assert item.wrist_angle_degrees == pytest.approx(12.5)
-            assert item.wrist_image is None
+            assert item.wrist_position is None
 
     finally:
         channel.close()
         server.stop()
 
 
-def test_ingress_server_accepts_wrist_image_hint():
+def test_ingress_server_accepts_wrist_position():
     q = queue.Queue(maxsize=8)
     stop = threading.Event()
     server = IngressServer(q, stop, port=0)
@@ -143,11 +143,11 @@ def test_ingress_server_accepts_wrist_image_hint():
     channel = grpc.insecure_channel(f"localhost:{port}")
     stub = hand_stream_pb2_grpc.HandStreamStub(channel)
     kp = plausible_hand_keypoints().astype(np.float32)
-    hint = np.array([0.41, 0.52, 0.13], dtype=np.float32)
+    wrist = np.array([0.41, 0.52, 0.13], dtype=np.float32)
 
     def gen_frames():
         yield hand_stream_pb2.HandFrame(
-            keypoints=kp.ravel().tolist() + hint.tolist(),
+            keypoints=kp.ravel().tolist() + wrist.tolist(),
             handedness="right",
             timestamp_ns=time.time_ns(),
         )
@@ -157,13 +157,13 @@ def test_ingress_server_accepts_wrist_image_hint():
         assert response.frames_received == 1
         item = q.get(timeout=1.0)
         assert item.keypoints.shape == CANONICAL_LANDMARK_SHAPE
-        np.testing.assert_allclose(item.wrist_image, hint)
+        np.testing.assert_allclose(item.wrist_position, wrist)
     finally:
         channel.close()
         server.stop()
 
 
-def test_ingress_server_accepts_depth_wrist_hint():
+def test_ingress_server_accepts_depth_wrist_position():
     q = queue.Queue(maxsize=8)
     stop = threading.Event()
     server = IngressServer(q, stop, port=0)
@@ -171,15 +171,15 @@ def test_ingress_server_accepts_depth_wrist_hint():
     channel = grpc.insecure_channel(f"localhost:{port}")
     stub = hand_stream_pb2_grpc.HandStreamStub(channel)
     kp = plausible_hand_keypoints().astype(np.float32)
-    hints = [
+    wrists = [
         np.array([0.41, 0.52, 0.13, 0.05, -0.02, 0.61], dtype=np.float32),
         np.array([0.41, 0.52, 0.13, np.nan, np.nan, np.nan], dtype=np.float32),
     ]
 
     def gen_frames():
-        for hint in hints:
+        for wrist in wrists:
             yield hand_stream_pb2.HandFrame(
-                keypoints=kp.ravel().tolist() + hint.tolist(),
+                keypoints=kp.ravel().tolist() + wrist.tolist(),
                 handedness="right",
                 timestamp_ns=time.time_ns(),
             )
@@ -187,9 +187,9 @@ def test_ingress_server_accepts_depth_wrist_hint():
     try:
         response = stub.StreamHandFrames(gen_frames())
         assert response.frames_received == 2
-        for hint in hints:
+        for wrist in wrists:
             item = q.get(timeout=1.0)
-            np.testing.assert_allclose(item.wrist_image, hint)
+            np.testing.assert_allclose(item.wrist_position, wrist)
     finally:
         channel.close()
         server.stop()

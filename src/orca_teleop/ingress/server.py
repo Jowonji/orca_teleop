@@ -27,8 +27,8 @@ import numpy as np
 
 from orca_teleop.constants import _COORDS_PER_POINT, _EXPECTED_LEN, _NUM_KEYPOINTS, DEFAULT_PORT
 
-# MediaPipe wrist hint: image x, y, palm_width [+ palm X, Y, Z meters from RGB-D].
-_ARM_HINT_LENS = (3, 6)
+# MediaPipe wrist position: image x, y, palm_width [+ wrist X, Y, Z meters from RGB-D].
+_WRIST_POSITION_LENS = (3, 6)
 from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ class HandLandmarks:
     timestamp_ns: int
     wrist_angle_degrees: float = 0.0
     # (3,) image x, y, palm_width, or (6,) with camera-frame palm X, Y, Z (m, NaN if no depth).
-    wrist_image: np.ndarray | None = None  # MediaPipe only
+    wrist_position: np.ndarray | None = None  # MediaPipe only
 
 
 class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
@@ -68,20 +68,20 @@ class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
                     break
 
                 n = len(frame.keypoints)
-                wrist_image = None
-                if n - _EXPECTED_LEN in _ARM_HINT_LENS:
+                wrist_position = None
+                if n - _EXPECTED_LEN in _WRIST_POSITION_LENS:
                     raw = np.array(frame.keypoints, dtype=np.float32)
                     keypoints = raw[:_EXPECTED_LEN].reshape(_NUM_KEYPOINTS, _COORDS_PER_POINT)
-                    wrist_image = raw[_EXPECTED_LEN:]
+                    wrist_position = raw[_EXPECTED_LEN:]
                 elif n == _EXPECTED_LEN:
                     keypoints = np.array(frame.keypoints, dtype=np.float32).reshape(
                         _NUM_KEYPOINTS, _COORDS_PER_POINT
                     )
                 else:
                     logger.warning(
-                        "Dropping frame: expected %d (+%s hint) floats, got %d",
+                        "Dropping frame: expected %d (+%s wrist position) floats, got %d",
                         _EXPECTED_LEN,
-                        "/".join(str(k) for k in _ARM_HINT_LENS),
+                        "/".join(str(k) for k in _WRIST_POSITION_LENS),
                         n,
                     )
                     continue
@@ -96,7 +96,7 @@ class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
                     handedness=handedness,
                     timestamp_ns=frame.timestamp_ns,
                     wrist_angle_degrees=frame.wrist_angle_degrees,
-                    wrist_image=wrist_image,
+                    wrist_position=wrist_position,
                 )
 
                 # Always keep the latest frame; drop stale ones.
