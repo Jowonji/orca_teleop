@@ -388,6 +388,14 @@ def _main_record(argv: list[str]) -> None:
         "(Orbbec Gemini color is usually /dev/video6; do not pass a depth/IR node).",
     )
     parser.add_argument(
+        "--depth",
+        choices=["auto", "orbbec", "off", "webcam"],
+        default="auto",
+        help="MediaPipe arm cue for --local: 'auto' (default) Orbbec depth when present, "
+        "'orbbec' require metric RGB-D, 'off' Orbbec color with the image-only cue "
+        "(baseline for comparison), 'webcam' OpenCV webcam without the Orbbec SDK.",
+    )
+    parser.add_argument(
         "--backend",
         choices=["hardware", "sim", "combined"],
         default="hardware",
@@ -577,16 +585,18 @@ def _main_record(argv: list[str]) -> None:
                         DEFAULT_CONFIDENCE,
                         args.show_video,
                         args.teleop_camera,
+                        args.depth,
                     ),
                     name="mediapipe-publisher",
                     daemon=True,
                 )
             publisher_process.start()
             logger.info(
-                "Local %s publisher started (pid=%d, hand=%s)",
+                "Local %s publisher started (pid=%d, hand=%s, depth=%s)",
                 args.source,
                 publisher_process.pid,
                 args.hand,
+                args.depth if args.source == "mediapipe" else "n/a",
             )
 
     sink.connect()
