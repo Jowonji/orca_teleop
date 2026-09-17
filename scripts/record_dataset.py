@@ -54,7 +54,8 @@ Example usage:
         --urdf-path $ORCAHAND_DESCRIPTION_DIR/v1/models/urdf/orcahand_right.urdf \
         --episode-end space --num-episodes 5
 
-    # Combined Nero arm (rest hold) + Orca fingers on nero_orca MJCF.
+    # Combined Nero arm + Orca fingers on nero_orca MJCF. Add --nero-output/--orca-output
+    # shadow (read real joints, ghost the command) or real (send) for hardware.
     python scripts/record_dataset.py --backend combined --local --source mediapipe --show-video \
         --overwrite --fps 15 --episode-end space --num-episodes 5 \
         --urdf-path $ORCAHAND_DESCRIPTION_DIR/v1/models/urdf/orcahand_right.urdf \
@@ -403,6 +404,32 @@ def _main_record(argv: list[str]) -> None:
         "'combined' loads nero_orca MJCF (Nero rest + Orca fingers).",
     )
     parser.add_argument(
+        "--nero-output",
+        choices=["sim", "shadow", "real"],
+        default="sim",
+        help="--backend combined: Nero arm output. 'sim' MuJoCo physics (default), "
+        "'shadow' read the real arm and show commands as a viewer ghost without sending, "
+        "'real' send commands to the real arm.",
+    )
+    parser.add_argument(
+        "--orca-output",
+        choices=["sim", "shadow", "real"],
+        default="sim",
+        help="--backend combined: Orca hand output, same modes as --nero-output. "
+        "Hardware modes use --model-path for the physical hand config.",
+    )
+    parser.add_argument(
+        "--nero-can",
+        default="can0",
+        help="SocketCAN channel of the Nero arm (default: can0).",
+    )
+    parser.add_argument(
+        "--nero-speed",
+        type=int,
+        default=20,
+        help="Nero speed percent for --nero-output real (default: 20).",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=DEFAULT_PORT,
@@ -509,15 +536,27 @@ def _main_record(argv: list[str]) -> None:
         if args.hand != "right":
             parser.error("--backend combined is the right-hand Nero+Orca model only.")
         nero_orca = Path(__file__).resolve().parents[2] / "nero_orca"
-        if not (nero_orca / "sim_sink.py").exists():
-            parser.error(f"combined backend needs {nero_orca / 'sim_sink.py'}")
+        if not (nero_orca / "combined_sink.py").exists():
+            parser.error(f"combined backend needs {nero_orca / 'combined_sink.py'}")
         sys.path.insert(0, str(nero_orca))
-        from sim_sink import CombinedNeroOrcaSimSink
+        from combined_sink import CombinedNeroOrcaSink
 
-        sink = CombinedNeroOrcaSimSink(
+        sink = CombinedNeroOrcaSink(
             camera_configs=camera_configs,
             control_hz=float(args.fps),
+            nero_output=args.nero_output,
+            orca_output=args.orca_output,
+            nero_can=args.nero_can,
+            nero_speed_percent=args.nero_speed,
+            orca_model_path=args.model_path,
         )
+        if "real" in (args.nero_output, args.orca_output):
+            logger.warning(
+                "REAL HARDWARE OUTPUT (nero=%s, orca=%s): the robot will move. "
+                "Keep the emergency stop in reach.",
+                args.nero_output,
+                args.orca_output,
+            )
     elif args.backend == "sim":
         from orca_teleop.sim import OrcaHandSimSink
 
