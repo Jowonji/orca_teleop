@@ -614,9 +614,10 @@ def run_local(
     retargeter_backend: RetargeterBackend = "adaptive_analytical",
     retargeter_config_path: str | None = None,
     camera_index: int | None = None,
+    depth: str = "auto",
 ) -> None:
     """Run ``run()`` plus a local MediaPipe publisher for one-command teleop.
-    Useful for prototyping.
+    Useful for prototyping. ``depth`` is the publisher's ``--depth`` mode.
     """
     import multiprocessing
 
@@ -626,16 +627,17 @@ def run_local(
     ctx = multiprocessing.get_context("spawn")
     publisher_process = ctx.Process(
         target=_mediapipe_publisher,
-        args=(port, handedness, confidence, show_video, camera_index),
+        args=(port, handedness, confidence, show_video, camera_index, depth),
         name="mediapipe-publisher",
         daemon=True,
     )
 
     publisher_process.start()
     logger.info(
-        "Local MediaPipe publisher started (pid=%d, hand=%s)",
+        "Local MediaPipe publisher started (pid=%d, hand=%s, depth=%s)",
         publisher_process.pid,
         handedness,
+        depth,
     )
 
     try:
