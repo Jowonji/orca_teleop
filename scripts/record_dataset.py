@@ -686,7 +686,8 @@ def _main_record(argv: list[str]) -> None:
         )
         stub_thread = threading.Thread(
             target=_stub_action_publisher,
-            args=(queues.actions_q, stop_event, joint_ids, args.fps),
+            # Hand joints only: the combined sink's dataset ids also include nero_joint*.
+            args=(queues.actions_q, stop_event, list(sink.home_position().as_dict()), args.fps),
             name="stub-action-publisher",
         )
         stub_thread.start()
