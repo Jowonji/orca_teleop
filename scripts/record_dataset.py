@@ -886,6 +886,9 @@ def _main_record(argv: list[str]) -> None:
         teleop_thread.join(timeout=JOIN_TIMEOUT)
 
         recorder_thread.join()
+        # LeRobot >= 0.4 buffers episode metadata; without finalize() meta/episodes/
+        # is never written and the dataset cannot be loaded.
+        dataset.finalize()
 
         try:
             num_eps = dataset.num_episodes
