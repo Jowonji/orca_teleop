@@ -698,6 +698,8 @@ def _main_record(argv: list[str]) -> None:
             kwargs={
                 "landmark_source": ("webxr" if args.source == "metaquest" else "mediapipe"),
                 "landmark_hook": getattr(sink, "update_wrist_position", None),
+                # Retarget no faster than we record: the sinks step at --fps anyway.
+                "max_hz": float(args.fps),
             },
             name="retargeter",
         )

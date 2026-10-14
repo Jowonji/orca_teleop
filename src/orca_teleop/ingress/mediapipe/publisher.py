@@ -109,8 +109,9 @@ def _prepare_opencv_gui() -> bool:
                 break
     try:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        # Top-left; the Nero+Orca MuJoCo viewer fills the screen to its right.
         cv2.resizeWindow(WINDOW_NAME, 640, 480)
-        cv2.moveWindow(WINDOW_NAME, 80, 80)
+        cv2.moveWindow(WINDOW_NAME, 20, 60)
         cv2.waitKey(1)
     except cv2.error as err:
         logger.warning(
