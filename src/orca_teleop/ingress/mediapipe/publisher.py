@@ -109,8 +109,9 @@ def _prepare_opencv_gui() -> bool:
                 break
     try:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        # Top-left; the Nero+Orca MuJoCo viewer fills the screen to its right.
         cv2.resizeWindow(WINDOW_NAME, 640, 480)
-        cv2.moveWindow(WINDOW_NAME, 80, 80)
+        cv2.moveWindow(WINDOW_NAME, 20, 60)
         cv2.waitKey(1)
     except cv2.error as err:
         logger.warning(
@@ -362,6 +363,8 @@ class MediaPipePublisher:
         show_video: bool = False,
         camera_index: int | None = None,
         depth: str = "auto",
+        orbbec_serial: str | None = None,
+        orbbec_laser_level: int | None = None,
     ) -> None:
         if depth not in DEPTH_MODES:
             raise ValueError(f"depth must be one of {DEPTH_MODES} (got {depth!r})")
@@ -373,6 +376,8 @@ class MediaPipePublisher:
         self._landmarker = None
         self._capture_fourcc = ""
         self._depth_mode = depth
+        self._orbbec_serial = orbbec_serial
+        self._orbbec_laser_level = orbbec_laser_level
         self._send_depth = depth in {"auto", "orbbec"}
         self._rgbd: OrbbecRGBDCamera | None = None
         self._depth_by_ts: OrderedDict[int, np.ndarray] = OrderedDict()
@@ -479,7 +484,7 @@ class MediaPipePublisher:
             # stopped cleanly (an Orbbec pipeline left running stalls the next start).
             signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
         if self._depth_mode != "webcam":
-            self._rgbd = open_orbbec()
+            self._rgbd = open_orbbec(self._orbbec_serial, self._orbbec_laser_level)
             if self._rgbd is None and self._depth_mode == "orbbec":
                 raise RuntimeError("--depth orbbec requested but no Orbbec RGB-D camera opened")
         if self._rgbd is None:
@@ -637,6 +642,20 @@ def main() -> None:
         "image cue (baseline); 'webcam' forces the OpenCV webcam.",
     )
     parser.add_argument(
+        "--orbbec-serial",
+        default=None,
+        help="Serial of the Orbbec to use for depth when several are attached "
+        "(default: the first found).",
+    )
+    parser.add_argument(
+        "--orbbec-laser-level",
+        type=int,
+        default=None,
+        choices=range(7),
+        help="Orbbec IR laser power 0-6 (default: leave the camera's setting). Lower it "
+        "when color + depth resets the camera on a bus-powered hub.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -656,6 +675,8 @@ def main() -> None:
         show_video=args.show_video,
         camera_index=args.camera,
         depth=args.depth,
+        orbbec_serial=args.orbbec_serial,
+        orbbec_laser_level=args.orbbec_laser_level,
     )
     publisher.run()
 

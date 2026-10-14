@@ -280,6 +280,7 @@ def retargeter_worker(
     landmarks_viz: Any | None = None,
     landmark_source: LandmarkSource = "mediapipe",
     landmark_hook: Any | None = None,
+    max_hz: float | None = None,
 ) -> None:
     """Consume ``HandLandmarks`` from the gRPC ingress, retarget, push to actions_q.
 
@@ -289,6 +290,11 @@ def retargeter_worker(
     auto-scale calibration, and the URDF-frame transform internally. During the
     calibration window it may return ``None``, in which case no robot command is
     enqueued yet.
+
+    ``max_hz`` caps the retarget rate and retargets only the newest queued frame,
+    dropping stale ones. A retarget is ~30 ms of GIL-holding Python, so retargeting
+    every 30 fps webcam frame starves other threads in the process (the dataset
+    recorder dropped a third of its 15 Hz frames). ``None`` keeps every frame.
     """
     if landmark_source not in ("mediapipe", "metaquest", "webxr"):
         raise ValueError(
@@ -312,11 +318,23 @@ def retargeter_worker(
             logger.exception("Retargeter init failed; shutting down worker.")
             return
 
+        min_period = 1.0 / max_hz if max_hz else 0.0
+        next_retarget = time.perf_counter()
         while not stop_event.is_set():
             try:
                 item = queues.landmarks_q.get(timeout=HEARTBEAT_INTERVAL)
             except queue.Empty:
                 continue
+            if min_period:
+                wait = next_retarget - time.perf_counter()
+                if wait > 0:
+                    time.sleep(wait)
+                while item is not _SHUTDOWN:
+                    try:
+                        item = queues.landmarks_q.get_nowait()
+                    except queue.Empty:
+                        break
+                next_retarget = time.perf_counter() + min_period
             if item is _SHUTDOWN:
                 break
 
@@ -521,6 +539,8 @@ def _mediapipe_publisher(
     show_video: bool,
     camera_index: int | None = None,
     depth: str = "auto",
+    orbbec_serial: str | None = None,
+    orbbec_laser_level: int | None = None,
 ) -> None:
     """Entry point for the MediaPipe publisher."""
     from orca_teleop.ingress.mediapipe.publisher import MediaPipePublisher
@@ -558,6 +578,8 @@ def _mediapipe_publisher(
         show_video=show_video,
         camera_index=camera_index,
         depth=depth,
+        orbbec_serial=orbbec_serial,
+        orbbec_laser_level=orbbec_laser_level,
     )
     publisher.run()
 
