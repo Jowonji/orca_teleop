@@ -539,6 +539,8 @@ def _mediapipe_publisher(
     show_video: bool,
     camera_index: int | None = None,
     depth: str = "auto",
+    orbbec_serial: str | None = None,
+    orbbec_laser_level: int | None = None,
 ) -> None:
     """Entry point for the MediaPipe publisher."""
     from orca_teleop.ingress.mediapipe.publisher import MediaPipePublisher
@@ -576,6 +578,8 @@ def _mediapipe_publisher(
         show_video=show_video,
         camera_index=camera_index,
         depth=depth,
+        orbbec_serial=orbbec_serial,
+        orbbec_laser_level=orbbec_laser_level,
     )
     publisher.run()
 

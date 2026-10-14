@@ -33,18 +33,46 @@ OUTLIER_M = 0.06  # palm landmarks farther than this from the palm median are dr
 class OrbbecRGBDCamera:
     """Color + depth-aligned-to-color from an Orbbec camera (e.g. Gemini 335)."""
 
-    def __init__(self, width: int = WIDTH, height: int = HEIGHT, fps: int = FPS) -> None:
+    def __init__(
+        self,
+        width: int = WIDTH,
+        height: int = HEIGHT,
+        fps: int = FPS,
+        serial: str | None = None,
+        laser_level: int | None = None,
+    ) -> None:
+        """``serial`` picks one Orbbec when several are attached (default: the first found).
+
+        With a serial the SDK uses the kernel V4L2 backend: its default libuvc backend
+        detaches uvcvideo from the cameras, which takes the other Orbbec's color node away
+        from the OpenCV recorder. ``laser_level`` (0-6, Gemini 335) lowers the IR projector:
+        on a bus-powered hub, color + depth with the laser at 5-6 reset the camera, 1-4 ran.
+        """
         from pyorbbecsdk import (
             AlignFilter,
             Config,
+            Context,
             OBFormat,
             OBFrameAggregateOutputMode,
+            OBPropertyID,
             OBSensorType,
             OBStreamType,
+            OBUvcBackendType,
             Pipeline,
         )
 
-        self._pipeline = Pipeline()
+        if serial:
+            # The device list is only valid while its Context lives.
+            self._context = Context()
+            self._context.set_uvc_backend_type(OBUvcBackendType.V4L2)
+            device = self._context.query_devices().get_device_by_serial_number(serial)
+            self._pipeline = Pipeline(device)
+        else:
+            self._pipeline = Pipeline()
+        if laser_level is not None:
+            device = self._pipeline.get_device()
+            device.set_int_property(OBPropertyID.OB_PROP_LASER_CONTROL_INT, 1)
+            device.set_int_property(OBPropertyID.OB_PROP_LASER_POWER_LEVEL_CONTROL_INT, laser_level)
         color_profile = self._pipeline.get_stream_profile_list(
             OBSensorType.COLOR_SENSOR
         ).get_video_stream_profile(width, height, OBFormat.RGB, fps)
@@ -149,10 +177,12 @@ class OrbbecRGBDCamera:
             pass
 
 
-def open_orbbec() -> OrbbecRGBDCamera | None:
-    """Open the first Orbbec RGB-D camera, or return None when unavailable."""
+def open_orbbec(
+    serial: str | None = None, laser_level: int | None = None
+) -> OrbbecRGBDCamera | None:
+    """Open the Orbbec RGB-D camera (``serial``, else the first), or None when unavailable."""
     try:
-        return OrbbecRGBDCamera()
+        return OrbbecRGBDCamera(serial=serial, laser_level=laser_level)
     except ImportError:
         logger.info("pyorbbecsdk not installed; using the OpenCV webcam without depth")
     except Exception as err:  # noqa: BLE001 - SDK raises plain RuntimeError/OBError

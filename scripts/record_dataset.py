@@ -389,6 +389,20 @@ def _main_record(argv: list[str]) -> None:
         "(Orbbec Gemini color is usually /dev/video6; do not pass a depth/IR node).",
     )
     parser.add_argument(
+        "--teleop-orbbec-serial",
+        default=None,
+        help="Serial of the hand-tracking Orbbec for --depth auto|orbbec when several are "
+        "attached (default: the first found, which may be the --camera recording one).",
+    )
+    parser.add_argument(
+        "--teleop-orbbec-laser-level",
+        type=int,
+        default=None,
+        choices=range(7),
+        help="IR laser power 0-6 for the hand-tracking Orbbec (default: camera setting). "
+        "Color + depth at 5-6 resets a Gemini 335 on a bus-powered hub; 3 is safe there.",
+    )
+    parser.add_argument(
         "--depth",
         choices=["auto", "orbbec", "off", "webcam"],
         default="auto",
@@ -422,6 +436,18 @@ def _main_record(argv: list[str]) -> None:
         "--nero-can",
         default="can0",
         help="SocketCAN channel of the Nero arm (default: can0).",
+    )
+    parser.add_argument(
+        "--pick-place",
+        action="store_true",
+        help="--backend combined: 3-DoF arm for pick-and-place (Nero J3/J5/J6 locked, hand "
+        "tilted 45 deg down, home in front of the robot). The robot first moves there.",
+    )
+    parser.add_argument(
+        "--mirror-lateral",
+        action="store_true",
+        help="--backend combined: the hand camera faces the operator (mirror view); flip "
+        "the arm's left/right so moving your hand right moves the arm right.",
     )
     parser.add_argument(
         "--nero-speed",
@@ -549,6 +575,8 @@ def _main_record(argv: list[str]) -> None:
             nero_can=args.nero_can,
             nero_speed_percent=args.nero_speed,
             orca_model_path=args.model_path,
+            mirror_lateral=args.mirror_lateral,
+            pick_place=args.pick_place,
         )
         if "real" in (args.nero_output, args.orca_output):
             logger.warning(
@@ -625,6 +653,8 @@ def _main_record(argv: list[str]) -> None:
                         args.show_video,
                         args.teleop_camera,
                         args.depth,
+                        args.teleop_orbbec_serial,
+                        args.teleop_orbbec_laser_level,
                     ),
                     name="mediapipe-publisher",
                     daemon=True,
