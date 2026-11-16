@@ -64,6 +64,14 @@ Example usage:
         --root $HOME/workspace/nero_orca/datasets/nero-orca-sim-mediapipe
 
 
+    # Combined backend driven by Rokoko Smartgloves (Studio streaming JSON v3 to UDP 14043);
+    # no webcam, no gRPC ingress. Hand only: the arm holds its home pose.
+    python scripts/record_dataset.py --backend combined --source rokoko \
+        --overwrite --fps 15 --episode-end space --num-episodes 5 \
+        --urdf-path $ORCAHAND_DESCRIPTION_DIR/v1/models/urdf/orcahand_right.urdf \
+        --repo-id keti/nero-orca-sim-rokoko --task "flex fingers, arm at rest" \
+        --root $HOME/workspace/nero_orca/datasets/nero-orca-sim-rokoko
+
     # Teleop the REAL hand with Manus gloves, ending each episode by pressing SPACE
     # (prerequisite: 'manus-client run' streaming glove data)
     python scripts/record_dataset.py --repo-id $HF_USERNAME/orca-manus \\
@@ -468,14 +476,22 @@ def _main_record(argv: list[str]) -> None:
     )
     parser.add_argument(
         "--source",
-        choices=["mediapipe", "manus", "metaquest"],
+        choices=["mediapipe", "manus", "metaquest", "rokoko"],
         default="mediapipe",
         help=(
             "Input publisher and landmark convention: 'mediapipe' webcam (default), "
-            "'manus' gloves (requires 'manus-client run'), or 'metaquest' WebXR in "
-            "Quest Browser. With --local the matching publisher is launched here; "
-            "without --local, launch it separately and point it at this ingress."
+            "'manus' gloves (requires 'manus-client run'), 'metaquest' WebXR in "
+            "Quest Browser, or 'rokoko' Smartgloves UDP stream (nero_orca/rokoko, no "
+            "ingress/retargeter thread; hand only, the arm stays home). With --local the "
+            "matching publisher is launched here; without --local, launch it separately "
+            "and point it at this ingress."
         ),
+    )
+    parser.add_argument(
+        "--rokoko-port",
+        type=int,
+        default=14043,
+        help="UDP port Rokoko Studio streams to for --source rokoko (default: 14043).",
     )
     parser.add_argument(
         "--hand",
@@ -610,7 +626,17 @@ def _main_record(argv: list[str]) -> None:
     publisher_process = None
     quest_reset_event = None
 
-    if not args.stub:
+    rokoko_receiver = None
+    if args.source == "rokoko" and not args.stub:
+        # The glove stream replaces the gRPC ingress + retargeter; bind first so a port
+        # clash fails before the slow sim/hardware connect.
+        nero_orca = Path(__file__).resolve().parents[2] / "nero_orca"
+        if str(nero_orca) not in sys.path:
+            sys.path.insert(0, str(nero_orca))
+        from rokoko.stream import RokokoReceiver
+
+        rokoko_receiver = RokokoReceiver(args.rokoko_port)
+    elif not args.stub:
         # Listen before the slow sim/hardware connect so MediaPipe can open
         # the RGB camera while MuJoCo is still loading.
         ingress_server = IngressServer(queues.landmarks_q, stop_event, port=args.port)
@@ -721,6 +747,17 @@ def _main_record(argv: list[str]) -> None:
             name="stub-action-publisher",
         )
         stub_thread.start()
+    elif rokoko_receiver is not None:
+        from rokoko.retarget import RokokoHandRetargeter
+        from rokoko.worker import rokoko_worker
+
+        rokoko_retargeter = RokokoHandRetargeter(model_path, args.urdf_path)
+        retargeter_thread = threading.Thread(
+            target=rokoko_worker,
+            args=(rokoko_receiver, rokoko_retargeter, queues.actions_q, stop_event, float(args.fps)),
+            name="rokoko",
+        )
+        retargeter_thread.start()
     else:
         retargeter_thread = threading.Thread(
             target=retargeter_worker,
@@ -913,6 +950,8 @@ def _main_record(argv: list[str]) -> None:
             publisher_process.join(timeout=3.0)
         if retargeter_thread is not None:
             retargeter_thread.join(timeout=JOIN_TIMEOUT)
+        if rokoko_receiver is not None:
+            rokoko_receiver.close()
         if stub_thread is not None:
             stub_thread.join(timeout=JOIN_TIMEOUT)
         teleop_thread.join(timeout=JOIN_TIMEOUT)
