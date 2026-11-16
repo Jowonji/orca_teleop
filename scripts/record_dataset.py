@@ -755,6 +755,7 @@ def _main_record(argv: list[str]) -> None:
         retargeter_thread = threading.Thread(
             target=rokoko_worker,
             args=(rokoko_receiver, rokoko_retargeter, queues.actions_q, stop_event, float(args.fps)),
+            kwargs={"pitch_hook": getattr(sink, "update_hand_pitch", None)},
             name="rokoko",
         )
         retargeter_thread.start()
