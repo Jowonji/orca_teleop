@@ -452,6 +452,13 @@ def _main_record(argv: list[str]) -> None:
         "tilted 45 deg down, home in front of the robot). The robot first moves there.",
     )
     parser.add_argument(
+        "--pick-pitch-deg",
+        type=float,
+        default=None,
+        help="--pick-place: hand tilt held as Nero J2+J4+J7 in deg (default 135 = fingers "
+        "~45 deg down; 90 = level, pointing forward).",
+    )
+    parser.add_argument(
         "--mirror-lateral",
         action="store_true",
         help="--backend combined: the hand camera faces the operator (mirror view); flip "
@@ -593,6 +600,7 @@ def _main_record(argv: list[str]) -> None:
             orca_model_path=args.model_path,
             mirror_lateral=args.mirror_lateral,
             pick_place=args.pick_place,
+            pick_pitch_deg=args.pick_pitch_deg,
         )
         if "real" in (args.nero_output, args.orca_output):
             logger.warning(
