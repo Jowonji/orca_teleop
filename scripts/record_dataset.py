@@ -448,8 +448,15 @@ def _main_record(argv: list[str]) -> None:
     parser.add_argument(
         "--pick-place",
         action="store_true",
-        help="--backend combined: 3-DoF arm for pick-and-place (Nero J3/J5/J6 locked, hand "
-        "tilted 45 deg down, home in front of the robot). The robot first moves there.",
+        help="--backend combined: 3-DoF arm for pick-and-place (Nero J3/J5/J6 locked, flange "
+        "level, home in front of the robot). The robot first moves there.",
+    )
+    parser.add_argument(
+        "--pick-pitch-deg",
+        type=float,
+        default=None,
+        help="--pick-place: hand tilt held as Nero J2+J4+J7 in deg (default 90 = flange level, "
+        "hand forward; 135 = fingers ~45 deg down, top-down grasp).",
     )
     parser.add_argument(
         "--mirror-lateral",
@@ -593,6 +600,7 @@ def _main_record(argv: list[str]) -> None:
             orca_model_path=args.model_path,
             mirror_lateral=args.mirror_lateral,
             pick_place=args.pick_place,
+            pick_pitch_deg=args.pick_pitch_deg,
         )
         if "real" in (args.nero_output, args.orca_output):
             logger.warning(
